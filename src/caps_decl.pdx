@@ -1,0 +1,538 @@
+// src/caps_decl.pdx — libpdx-cap.M1-002
+// CapsDecl module: parser for the caps.decl text file every tool ships
+// at its repo root (per invariant I6 in design/tooling/plan.md).
+//
+// Design context
+// --------------
+// Every tool declares which capabilities it consumes at exec in a
+// caps.decl file (see caps.decl at repo root as a canonical example).
+// libpdx-cap parses that file into a machine-readable record so
+// cap_manifest_verify (M2-001) can compare declared-vs-received cap
+// sets. The parser is invoked ONCE per process at _start; the record
+// lives in .bss (singleton pattern).
+//
+// Grammar (M1 subset — full spec in design/architecture.md §4):
+//
+//   file    = line*
+//   line    = SPACES? content NL
+//   content = ""                                    (empty)
+//           | "#" ANYCHAR*                          (comment)
+//           | "requires:"                           (start REQ section)
+//           | "requires: (none)"                    (empty REQ, inline)
+//           | "declares_output_schemas:"            (start SCH section)
+//           | "declares_output_schemas: (none)"     (empty SCH, inline)
+//           | "-" SPACES item                       (list item)
+//   item    = IDENT ( "(" ANYCHAR* ")" )? ( "@" IDENT )?
+//
+// State machine:
+//   TOP  → accepts headers only
+//   REQ  → accepts list items OR the schemas header
+//   SCH  → accepts list items only
+//
+// Storage: singleton in .bss (mirrors ParsedArgs in libpdx-argv).
+//
+// paideia-as compliance
+// ---------------------
+//   - Module name PascalCase basename (`CapsDecl`), no directory prefix.
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses immediate ≤ 0x7FFFFFFF.
+//   - r11 is scratch (paideia-as-reserved).
+//   - Byte reads use `xor rax, rax; mov_b rax, [ptr]` (#1248 mitigation).
+//   - Leaf function; SysV push/pop parity preserved (only callee-save
+//     touched are r12 + r13; two pushes → return-addr-relative rsp
+//     alignment neutral for a function that makes no nested calls).
+
+module CapsDecl = structure {
+
+  // ============================================================================
+  // Return codes
+  // ============================================================================
+
+  // Success — parsed file honoured the grammar.
+  pub let CAPS_DECL_OK               : u64 = 0
+
+  // Too many requires items (> CAPS_DECL_MAX_REQ). The parser stops at
+  // the offending item; req_count == CAPS_DECL_MAX_REQ at that point.
+  pub let CAPS_DECL_REQ_OVERFLOW     : u64 = 0xFFFFFFFA
+
+  // Too many schema declarations (> CAPS_DECL_MAX_SCHEMAS). Symmetric
+  // to REQ_OVERFLOW.
+  pub let CAPS_DECL_SCHEMA_OVERFLOW  : u64 = 0xFFFFFFF9
+
+  // Line does not match any header form in the current state. The
+  // parser stops; error_line_index names the offending line.
+  pub let CAPS_DECL_MALFORMED_HEADER : u64 = 0xFFFFFFF8
+
+  // List item does not match `IDENT (...)? (@IDENT)?` — typically an
+  // empty item ("- \n") or a missing identifier ("-\n").
+  pub let CAPS_DECL_MALFORMED_ITEM   : u64 = 0xFFFFFFF7
+
+  // List item appeared in TOP state (before any section was opened).
+  pub let CAPS_DECL_ITEM_OUT_OF_SECTION : u64 = 0xFFFFFFF6
+
+  // ============================================================================
+  // Storage caps
+  // ============================================================================
+
+  // Max list items per section. Fits `cmp reg, imm ≤ 0x7FFFFFFF` by wide
+  // margin; the largest observed real caps.decl has 6 requires items
+  // (pkg install with signed-blob + audit + elevate + pdxfs read/write
+  // + tty).
+  pub let CAPS_DECL_MAX_REQ     : u64 = 16
+  pub let CAPS_DECL_MAX_SCHEMAS : u64 = 16
+
+  // ============================================================================
+  // State constants (parser-internal; exposed as pub for tests)
+  // ============================================================================
+
+  pub let STATE_TOP : u64 = 0
+  pub let STATE_REQ : u64 = 1
+  pub let STATE_SCH : u64 = 2
+
+  // ============================================================================
+  // Singleton storage (bootstrap-scope; M4 migrates to caller-owned)
+  // ============================================================================
+
+  // Requires-section records. Both arrays are indexed by k in
+  // 0..req_count. Every pointer is INTERIOR into the caller's source
+  // buffer; the parser NUL-terminates the identifier in place (same
+  // precedent as tokenizer.pdx and parser.pdx).
+  pub let mut req_kind_names : [u64; 16] = uninit @align(8)
+  pub let mut req_args_texts : [u64; 16] = uninit @align(8)  // 0 if item has no "(...)"
+  pub let mut req_count      : u64       = uninit @align(8)
+
+  // Declares-schemas records.
+  pub let mut schema_names   : [u64; 16] = uninit @align(8)
+  pub let mut schema_count   : u64       = uninit @align(8)
+
+  // Diagnostic slots.
+  pub let mut error_code       : u64 = uninit @align(8)
+  pub let mut error_line_index : u64 = uninit @align(8)
+
+  // ============================================================================
+  // caps_decl_reset()
+  //
+  // Clear the four counters + the two diagnostic slots. The pointer
+  // arrays (`req_kind_names`, `req_args_texts`, `schema_names`) are
+  // consumed by index up to their counters, so stale trailing entries
+  // are unreachable and do not need zeroing.
+  //
+  // Leaf; r11 scratch; no push/pop parity to preserve.
+  // ============================================================================
+  pub let caps_decl_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-cap.M1-002 caps_decl_reset. Zero the four counters + error slots so caps_decl_parse starts from a known-empty CapsDecl. xor rax,rax; four lea+mov to the four counters + two error slots. Pointer arrays are index-consumed, so trailing entries do not need zeroing (same idiom as ParsedArgs::reset in libpdx-argv). r11 is scratch (paideia-as conformance). Leaf.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + req_count];        mov [r11], rax;
+        lea r11, [rip + schema_count];     mov [r11], rax;
+        lea r11, [rip + error_code];       mov [r11], rax;
+        lea r11, [rip + error_line_index]; mov [r11], rax;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // caps_decl_parse(src, src_len) -> rc
+  //
+  // Signature: caps_decl_parse : (u64, u64) -> u64 !{mem} @{}
+  // RDI (input): src     — VA of the caps.decl text (NUL not required)
+  // RSI (input): src_len — number of bytes
+  // RAX (output): CAPS_DECL_OK or one of the CAPS_DECL_* error codes
+  //
+  // Walks src left-to-right one line at a time. Each line is classified
+  // by the first non-whitespace byte + (for headers) an exact-byte
+  // compare of the leading identifier. Successful list items get their
+  // identifier NUL-terminated in place at the boundary byte (`(`, `@`,
+  // ' ', or '\n') so downstream consumers see a C-string.
+  //
+  // On error the parser records `error_code` and `error_line_index`
+  // (0-indexed) and returns the same code in rax; consumers can render
+  // a diagnostic without a second load.
+  //
+  // Register plan (leaf, but uses two callee-save regs for line_index
+  // + end preservation — two pushes preserve SysV parity because the
+  // function makes NO nested calls):
+  //   r8  = cursor (running byte pointer into src)
+  //   r9  = end   (src + src_len; loaded once, never mutated)
+  //   r10 = state (STATE_TOP/REQ/SCH)
+  //   r11 = scratch (LEA target for every .bss store; masking scratch)
+  //   r12 = line_index (0-based; incremented at end of each line)  [callee-save]
+  //   r13 = walk cursor within current line  [callee-save]
+  //   rax = byte load / return value scratch
+  //   rcx = generic working cursor / count
+  //   rdx = current-line pointer (line_start; used for item recording)
+  // ============================================================================
+  pub let caps_decl_parse : (u64, u64) -> u64 !{mem} @{} =
+    fn (src: u64) (src_len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-cap.M1-002 caps_decl_parse. Line-oriented text parser for the caps.decl grammar (design/architecture.md §4). Walks src byte-by-byte with r8 as cursor, r9 as end (loaded once). State machine (r10) transitions TOP→REQ on 'requires:', TOP→SCH or REQ→SCH on 'declares_output_schemas:', TOP→TOP on '<hdr>: (none)'. In REQ / SCH, list items ('-') append to req_kind_names / schema_names with in-place NUL-termination at the item boundary (same idiom as tokenizer.pdx and libpdx-argv parser.pdx). Overflow gated at CAPS_DECL_MAX_REQ / CAPS_DECL_MAX_SCHEMAS before every write. paideia-as conformance: xor rax,rax; mov_b before every byte compare (#1248 mitigation); every cmp reg,imm uses imm ≤ 0x7FFFFFFF; r11 reserved as .bss LEA scratch. Two callee-save regs used (r12 line_index, r13 line-walk cursor) with matched push/pop; function makes NO nested calls so alignment is irrelevant.",
+      block: {
+        // ---- prologue -------------------------------------------------------
+        push r12;
+        push r13;
+
+        mov r8, rdi;                    // r8 = cursor = src
+        mov r9, rdi;
+        add r9, rsi;                    // r9 = end = src + src_len
+        xor r10, r10;                   // r10 = state = STATE_TOP (0)
+        xor r12, r12;                   // r12 = line_index = 0
+
+      // ==== per-line loop head =============================================
+      caps_line_head:
+        cmp r8, r9;
+        jge caps_parse_done_ok;
+
+        // ---- skip leading spaces/tabs ---------------------------------------
+      caps_skip_leading_ws:
+        cmp r8, r9;
+        jge caps_line_advance_newline_or_end;
+        xor rax, rax;
+        mov_b rax, [r8];
+        cmp rax, 0x20;                  // ' '
+        je caps_bump_leading_ws;
+        cmp rax, 0x09;                  // '\t'
+        je caps_bump_leading_ws;
+        jmp caps_classify_first;
+
+      caps_bump_leading_ws:
+        add r8, 1;
+        jmp caps_skip_leading_ws;
+
+        // ---- classify first non-ws byte -------------------------------------
+      caps_classify_first:
+        // rax = first non-ws byte at r8
+        cmp rax, 0x0A;                  // '\n' → empty line
+        je caps_line_consume_nl;
+        cmp rax, 0x23;                  // '#' → comment
+        je caps_line_skip_to_nl;
+        cmp rax, 0x2D;                  // '-' → list item
+        je caps_try_list_item;
+        cmp rax, 0x72;                  // 'r' → try "requires:"
+        je caps_try_requires;
+        cmp rax, 0x64;                  // 'd' → try "declares_output_schemas:"
+        je caps_try_declares;
+        // Any other first char → malformed header (unknown top-level form).
+        mov rax, 0xFFFFFFF8;            // CAPS_DECL_MALFORMED_HEADER
+        jmp caps_parse_fail;
+
+      // ==== "requires:" ====================================================
+      caps_try_requires:
+        // Byte-by-byte compare of "requires:" starting at r8.
+        //   r 0x72 | e 0x65 | q 0x71 | u 0x75 | i 0x69 | r 0x72 | e 0x65 | s 0x73 | : 0x3A
+        // Byte0 already known == 'r' (matched to reach here). Verify [1..8].
+        xor rax, rax; mov_b rax, [r8 + 1]; cmp rax, 0x65; jne caps_hdr_bad;  // e
+        xor rax, rax; mov_b rax, [r8 + 2]; cmp rax, 0x71; jne caps_hdr_bad;  // q
+        xor rax, rax; mov_b rax, [r8 + 3]; cmp rax, 0x75; jne caps_hdr_bad;  // u
+        xor rax, rax; mov_b rax, [r8 + 4]; cmp rax, 0x69; jne caps_hdr_bad;  // i
+        xor rax, rax; mov_b rax, [r8 + 5]; cmp rax, 0x72; jne caps_hdr_bad;  // r
+        xor rax, rax; mov_b rax, [r8 + 6]; cmp rax, 0x65; jne caps_hdr_bad;  // e
+        xor rax, rax; mov_b rax, [r8 + 7]; cmp rax, 0x73; jne caps_hdr_bad;  // s
+        xor rax, rax; mov_b rax, [r8 + 8]; cmp rax, 0x3A; jne caps_hdr_bad;  // ':'
+
+        // Advance past "requires:" (9 bytes).
+        add r8, 9;
+
+        // Look for optional " (none)" tail (or newline).
+        mov r13, r8;                    // r13 = probe cursor
+      caps_req_check_none:
+        cmp r13, r9;
+        jge caps_req_open_section;      // EOF right after "requires:" → open section
+        xor rax, rax;
+        mov_b rax, [r13];
+        cmp rax, 0x0A;                  // '\n' → open section
+        je caps_req_open_section;
+        cmp rax, 0x20;                  // ' ' → keep scanning
+        je caps_req_bump_none;
+        cmp rax, 0x28;                  // '(' → begin "(none)" check
+        je caps_req_try_none;
+        // Any other char between "requires:" and NL is malformed.
+        mov rax, 0xFFFFFFF8;            // CAPS_DECL_MALFORMED_HEADER
+        jmp caps_parse_fail;
+
+      caps_req_bump_none:
+        add r13, 1;
+        jmp caps_req_check_none;
+
+      caps_req_try_none:
+        // r13 == '('. Verify "(none)".
+        xor rax, rax; mov_b rax, [r13 + 1]; cmp rax, 0x6E; jne caps_hdr_bad;  // n
+        xor rax, rax; mov_b rax, [r13 + 2]; cmp rax, 0x6F; jne caps_hdr_bad;  // o
+        xor rax, rax; mov_b rax, [r13 + 3]; cmp rax, 0x6E; jne caps_hdr_bad;  // n
+        xor rax, rax; mov_b rax, [r13 + 4]; cmp rax, 0x65; jne caps_hdr_bad;  // e
+        xor rax, rax; mov_b rax, [r13 + 5]; cmp rax, 0x29; jne caps_hdr_bad;  // ')'
+        // "(none)" matched — section is empty; stay in TOP state.
+        xor r10, r10;                   // state = STATE_TOP
+        add r13, 6;
+        mov r8, r13;
+        jmp caps_line_skip_to_nl;       // consume rest of line + NL
+
+      caps_req_open_section:
+        // Open REQ section. r10 = STATE_REQ.
+        mov r10, 1;                     // STATE_REQ
+        mov r8, r13;
+        jmp caps_line_skip_to_nl;
+
+      // ==== "declares_output_schemas:" =====================================
+      caps_try_declares:
+        // Byte-by-byte compare of "declares_output_schemas:" (24 bytes).
+        // Byte0 already known == 'd'. Verify [1..23].
+        xor rax, rax; mov_b rax, [r8 +  1]; cmp rax, 0x65; jne caps_hdr_bad;  // e
+        xor rax, rax; mov_b rax, [r8 +  2]; cmp rax, 0x63; jne caps_hdr_bad;  // c
+        xor rax, rax; mov_b rax, [r8 +  3]; cmp rax, 0x6C; jne caps_hdr_bad;  // l
+        xor rax, rax; mov_b rax, [r8 +  4]; cmp rax, 0x61; jne caps_hdr_bad;  // a
+        xor rax, rax; mov_b rax, [r8 +  5]; cmp rax, 0x72; jne caps_hdr_bad;  // r
+        xor rax, rax; mov_b rax, [r8 +  6]; cmp rax, 0x65; jne caps_hdr_bad;  // e
+        xor rax, rax; mov_b rax, [r8 +  7]; cmp rax, 0x73; jne caps_hdr_bad;  // s
+        xor rax, rax; mov_b rax, [r8 +  8]; cmp rax, 0x5F; jne caps_hdr_bad;  // _
+        xor rax, rax; mov_b rax, [r8 +  9]; cmp rax, 0x6F; jne caps_hdr_bad;  // o
+        xor rax, rax; mov_b rax, [r8 + 10]; cmp rax, 0x75; jne caps_hdr_bad;  // u
+        xor rax, rax; mov_b rax, [r8 + 11]; cmp rax, 0x74; jne caps_hdr_bad;  // t
+        xor rax, rax; mov_b rax, [r8 + 12]; cmp rax, 0x70; jne caps_hdr_bad;  // p
+        xor rax, rax; mov_b rax, [r8 + 13]; cmp rax, 0x75; jne caps_hdr_bad;  // u
+        xor rax, rax; mov_b rax, [r8 + 14]; cmp rax, 0x74; jne caps_hdr_bad;  // t
+        xor rax, rax; mov_b rax, [r8 + 15]; cmp rax, 0x5F; jne caps_hdr_bad;  // _
+        xor rax, rax; mov_b rax, [r8 + 16]; cmp rax, 0x73; jne caps_hdr_bad;  // s
+        xor rax, rax; mov_b rax, [r8 + 17]; cmp rax, 0x63; jne caps_hdr_bad;  // c
+        xor rax, rax; mov_b rax, [r8 + 18]; cmp rax, 0x68; jne caps_hdr_bad;  // h
+        xor rax, rax; mov_b rax, [r8 + 19]; cmp rax, 0x65; jne caps_hdr_bad;  // e
+        xor rax, rax; mov_b rax, [r8 + 20]; cmp rax, 0x6D; jne caps_hdr_bad;  // m
+        xor rax, rax; mov_b rax, [r8 + 21]; cmp rax, 0x61; jne caps_hdr_bad;  // a
+        xor rax, rax; mov_b rax, [r8 + 22]; cmp rax, 0x73; jne caps_hdr_bad;  // s
+        xor rax, rax; mov_b rax, [r8 + 23]; cmp rax, 0x3A; jne caps_hdr_bad;  // ':'
+
+        // Advance past "declares_output_schemas:" (24 bytes).
+        add r8, 24;
+
+        // Look for optional " (none)" tail (or newline).
+        mov r13, r8;
+      caps_sch_check_none:
+        cmp r13, r9;
+        jge caps_sch_open_section;
+        xor rax, rax;
+        mov_b rax, [r13];
+        cmp rax, 0x0A;
+        je caps_sch_open_section;
+        cmp rax, 0x20;
+        je caps_sch_bump_none;
+        cmp rax, 0x28;
+        je caps_sch_try_none;
+        mov rax, 0xFFFFFFF8;            // CAPS_DECL_MALFORMED_HEADER
+        jmp caps_parse_fail;
+
+      caps_sch_bump_none:
+        add r13, 1;
+        jmp caps_sch_check_none;
+
+      caps_sch_try_none:
+        xor rax, rax; mov_b rax, [r13 + 1]; cmp rax, 0x6E; jne caps_hdr_bad;  // n
+        xor rax, rax; mov_b rax, [r13 + 2]; cmp rax, 0x6F; jne caps_hdr_bad;  // o
+        xor rax, rax; mov_b rax, [r13 + 3]; cmp rax, 0x6E; jne caps_hdr_bad;  // n
+        xor rax, rax; mov_b rax, [r13 + 4]; cmp rax, 0x65; jne caps_hdr_bad;  // e
+        xor rax, rax; mov_b rax, [r13 + 5]; cmp rax, 0x29; jne caps_hdr_bad;  // ')'
+        // "(none)" matched — stay in TOP (schemas section empty).
+        xor r10, r10;                   // state = STATE_TOP
+        add r13, 6;
+        mov r8, r13;
+        jmp caps_line_skip_to_nl;
+
+      caps_sch_open_section:
+        mov r10, 2;                     // STATE_SCH
+        mov r8, r13;
+        jmp caps_line_skip_to_nl;
+
+      caps_hdr_bad:
+        mov rax, 0xFFFFFFF8;            // CAPS_DECL_MALFORMED_HEADER
+        jmp caps_parse_fail;
+
+      // ==== "- IDENT..." list item =========================================
+      caps_try_list_item:
+        // r8 → '-'. Reject if not in REQ or SCH state.
+        cmp r10, 0;
+        je caps_item_out_of_section;
+
+        // Skip the '-' and any leading spaces/tabs before the identifier.
+        add r8, 1;
+      caps_item_skip_lead_ws:
+        cmp r8, r9;
+        jge caps_item_bad;
+        xor rax, rax;
+        mov_b rax, [r8];
+        cmp rax, 0x20;
+        je caps_item_bump_ws;
+        cmp rax, 0x09;
+        je caps_item_bump_ws;
+        cmp rax, 0x0A;                  // "-\n" or "-  \n" → bad item
+        je caps_item_bad;
+        jmp caps_item_ident_start;
+      caps_item_bump_ws:
+        add r8, 1;
+        jmp caps_item_skip_lead_ws;
+
+      caps_item_ident_start:
+        // rdx = identifier start pointer. Walk to first boundary byte:
+        //   '(' 0x28 | '@' 0x40 | ' ' 0x20 | '\t' 0x09 | '\n' 0x0A | EOF
+        mov rdx, r8;                    // rdx = ident start
+        mov r13, r8;                    // r13 = walk cursor
+
+      caps_item_walk_ident:
+        cmp r13, r9;
+        jge caps_item_ident_done_eof;
+        xor rax, rax;
+        mov_b rax, [r13];
+        cmp rax, 0x28;                  // '('
+        je caps_item_ident_done_paren;
+        cmp rax, 0x40;                  // '@'
+        je caps_item_ident_done_at;
+        cmp rax, 0x20;
+        je caps_item_ident_done_ws;
+        cmp rax, 0x09;
+        je caps_item_ident_done_ws;
+        cmp rax, 0x0A;
+        je caps_item_ident_done_nl;
+        add r13, 1;
+        jmp caps_item_walk_ident;
+
+      // ---- Four boundary-byte terminations: NUL-terminate + branch --------
+      caps_item_ident_done_paren:
+        // args-text begins at r13 (points to '('). NUL the '('. Record
+        // args ptr = original r13 (before overwrite; kept in rax post-op).
+        mov rcx, r13;                   // rcx = ptr to '(' for args record
+        xor rax, rax;
+        mov_b [r13], rax;               // NUL-terminate identifier
+        // Store item with args_text = rcx.
+        jmp caps_item_record;
+
+      caps_item_ident_done_at:
+      caps_item_ident_done_ws:
+      caps_item_ident_done_nl:
+        // Ident boundary. No args-text. Zero rcx before NUL so the store
+        // path sees args_text = 0.
+        xor rcx, rcx;
+        xor rax, rax;
+        mov_b [r13], rax;               // NUL-terminate identifier
+        jmp caps_item_record;
+
+      caps_item_ident_done_eof:
+        // Ident ran off the end. No trailing byte to NUL — the src
+        // buffer's caller-owned invariant guarantees the byte past r9
+        // is not our concern. Record args_text = 0.
+        xor rcx, rcx;
+        jmp caps_item_record;
+
+      // ---- Item record ----------------------------------------------------
+      caps_item_record:
+        // rdx = ident ptr. rcx = args ptr (or 0). r10 = state.
+        // Dispatch by state.
+        cmp r10, 1;                     // STATE_REQ
+        je caps_item_record_req;
+        cmp r10, 2;                     // STATE_SCH
+        je caps_item_record_sch;
+        // Unreachable: item_out_of_section already caught STATE_TOP.
+        mov rax, 0xFFFFFFF6;            // CAPS_DECL_ITEM_OUT_OF_SECTION
+        jmp caps_parse_fail;
+
+      caps_item_record_req:
+        lea r11, [rip + req_count];
+        mov rax, [r11];
+        cmp rax, 16;                    // CAPS_DECL_MAX_REQ
+        jge caps_req_overflow;
+
+        lea r11, [rip + req_kind_names];
+        mov [r11 + rax*8], rdx;
+
+        lea r11, [rip + req_args_texts];
+        mov [r11 + rax*8], rcx;
+
+        add rax, 1;
+        lea r11, [rip + req_count];
+        mov [r11], rax;
+
+        // Advance past whatever remained on the line.
+        mov r8, r13;
+        jmp caps_line_skip_to_nl;
+
+      caps_item_record_sch:
+        lea r11, [rip + schema_count];
+        mov rax, [r11];
+        cmp rax, 16;                    // CAPS_DECL_MAX_SCHEMAS
+        jge caps_sch_overflow;
+
+        lea r11, [rip + schema_names];
+        mov [r11 + rax*8], rdx;
+
+        add rax, 1;
+        lea r11, [rip + schema_count];
+        mov [r11], rax;
+
+        mov r8, r13;
+        jmp caps_line_skip_to_nl;
+
+      caps_item_bad:
+        mov rax, 0xFFFFFFF7;            // CAPS_DECL_MALFORMED_ITEM
+        jmp caps_parse_fail;
+
+      caps_item_out_of_section:
+        mov rax, 0xFFFFFFF6;            // CAPS_DECL_ITEM_OUT_OF_SECTION
+        jmp caps_parse_fail;
+
+      caps_req_overflow:
+        mov rax, 0xFFFFFFFA;            // CAPS_DECL_REQ_OVERFLOW
+        jmp caps_parse_fail;
+
+      caps_sch_overflow:
+        mov rax, 0xFFFFFFF9;            // CAPS_DECL_SCHEMA_OVERFLOW
+        jmp caps_parse_fail;
+
+      // ==== per-line trailer helpers =======================================
+      caps_line_skip_to_nl:
+        // Consume bytes until '\n' or EOF, then bump cursor past the NL.
+        cmp r8, r9;
+        jge caps_line_at_eof;
+        xor rax, rax;
+        mov_b rax, [r8];
+        cmp rax, 0x0A;
+        je caps_line_consume_nl;
+        add r8, 1;
+        jmp caps_line_skip_to_nl;
+
+      caps_line_consume_nl:
+        add r8, 1;                      // step past '\n'
+        add r12, 1;                     // line_index++
+        jmp caps_line_head;
+
+      caps_line_at_eof:
+        // No trailing NL — treat as end of file after this line.
+        add r12, 1;
+        jmp caps_parse_done_ok;
+
+      caps_line_advance_newline_or_end:
+        // Whitespace-only line — no content byte was found before EOF.
+        // Effectively a blank line at file end.
+        jmp caps_parse_done_ok;
+
+      // ==== exits ==========================================================
+      caps_parse_done_ok:
+        xor rax, rax;                   // CAPS_DECL_OK
+        lea r11, [rip + error_code];
+        mov [r11], rax;
+        jmp caps_parse_epilogue;
+
+      caps_parse_fail:
+        // rax = error code (already loaded by fail arm). Record it +
+        // line_index so the consumer's stderr diagnostic can point at
+        // the offending line.
+        lea r11, [rip + error_code];
+        mov [r11], rax;
+        lea r11, [rip + error_line_index];
+        mov [r11], r12;
+        // Fall through to epilogue with rax preserved.
+
+      caps_parse_epilogue:
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+}
