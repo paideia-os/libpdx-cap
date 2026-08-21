@@ -1,0 +1,27 @@
+# libpdx-cap — caps.decl
+#
+# Wave: R49
+# Doc:  design/tooling/r49-r50-plan.md §3.1 in the paideia-os repo.
+#
+# libpdx-cap is a pure userspace library. cap_pack writes bytes into a
+# caller-owned buffer; cap_unpack reads bytes from a caller-owned buffer
+# and populates the module's own .bss; cap_manifest_verify reads two
+# caller-owned buffers. No syscall is issued from any entry point in
+# any milestone through M4, so libpdx-cap requires NO capabilities of
+# its own. The wire-format buffers are backed by caps the CALLER holds
+# (typically KIND_IPC_ENDPOINT frames per sys_cap_transfer, or the
+# InitCap sidecar per src/kernel/core/loader/init_caps.pdx in
+# paideia-os).
+#
+# Callers that use libpdx-cap must independently declare in their own
+# caps.decl any caps their tool requires. This file exists so the R49
+# caps-manifest tooling can consult a uniform declaration for every
+# library — the exact analog of libpdx-argv/caps.decl.
+requires: (none)
+
+# Declared output schemas — libpdx-cap does not itself emit records
+# to a semantic pipe. When callers ask cap_pack to serialize a Cap
+# they receive raw wire bytes (see design/architecture.md §2); the
+# schema wrapping that goes on the semantic-pipe wire is
+# libpdx-semantic-pipe's PdxCap schema, declared there.
+declares_output_schemas: (none)

@@ -1,0 +1,302 @@
+// src/cap.pdx — libpdx-cap.M1-001
+// Cap module: wire format + pack/unpack + manifest_verify skeleton.
+//
+// Design context
+// --------------
+// M1 of the R49 shared-library wave: the userspace-side idiom for
+// serializing a capability across a process boundary (shell → tool via
+// sys_cap_transfer) and for verifying at exec that the received cap set
+// matches the callee's caps.decl. This module ships the format + the
+// pack/unpack helpers + the manifest_verify entry point; M2 fills the
+// manifest_verify body (OK | MISSING | EXTRA), M3 adds KIND_USER_ref
+// decode + signed-inode helpers.
+//
+// The wire record shape matches the InitCap sidecar record (paideia-os
+// src/kernel/core/loader/init_caps.pdx, R20b.M4-001) so a cap received
+// from the loader and a cap received via sys_cap_transfer share one
+// on-wire layout. Baseline: pack + unpack round-trip preserves slot +
+// kind + rights + target_ptr.
+//
+// Record layout (16 bytes per Cap, natural 8-byte alignment):
+//
+//   +0    u16 slot            (target slot in the task's cap_table; 0..255)
+//   +2    u16 kind            (KIND_* value — matches cap/kind.pdx in paideia-os)
+//   +4    u32 rights          (RIGHTS_* mask)
+//   +8    u64 target_ptr      (kind-specific; e.g. endpoint tail per kind_endpoint.pdx)
+//
+// M1 packs qword0 = slot | (kind << 16) | (rights << 32) with a single
+// store, and qword1 = target_ptr with a second store; unpack mirrors
+// with two loads + shifts + masks. This is the same two-quad idiom the
+// InitCap validator uses when reading a sidecar entry — no narrow-store
+// mnemonic is needed and the wire buffer never observes a torn write
+// between fields inside a single Cap.
+//
+// paideia-as compliance
+// ---------------------
+// Every function follows the constraints in
+// design/kernel/paideia-as-conformance.md (paideia-os):
+//   - Module name PascalCase basename (`Cap`), no directory prefix.
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses an immediate ≤ 0x7FFFFFFF (or fits in
+//     the small-imm sign-extend window); large immediates go via r11.
+//   - `r11` is scratch and is never assumed live across a call.
+//   - Byte loads use `xor rax, rax; mov_b rax, [ptr]` (per #1248
+//     mitigation) — cap_unpack uses qword loads only, so this pattern
+//     shows up in caps_decl.pdx (the text parser) rather than here.
+//   - Both entry points are LEAF functions in M1 — no callee-save
+//     touched, no push/pop parity to preserve.
+
+module Cap = structure {
+
+  // ============================================================================
+  // Format constants
+  // ============================================================================
+
+  // Size of one Cap record on the wire (16 bytes). Same as InitCap
+  // sidecar's INIT_CAP_ENTRY_SIZE — deliberate: a cap received from
+  // sys_cap_transfer and a cap seeded by the loader share one layout.
+  pub let CAP_ENTRY_SIZE : u64 = 16
+
+  // Alignment of a Cap record on the wire (8 bytes). Matches the
+  // sidecar's natural alignment so an array of Caps can be walked with
+  // qword loads at [base + i*16 + 0] and [base + i*16 + 8].
+  pub let CAP_ALIGN : u64 = 8
+
+  // Maximum accepted slot value (exclusive). Mirrors INIT_CAP_SLOT_MAX
+  // in paideia-os init_caps.pdx — the cap_table holds 256 slots per
+  // task (cap/table.pdx). A slot >= this bound cannot address a valid
+  // descriptor and cap_pack rejects it before touching the wire buffer.
+  pub let CAP_SLOT_MAX : u64 = 256
+
+  // ============================================================================
+  // Return codes
+  // ============================================================================
+
+  // Success. Every entry point returns this on the happy path.
+  pub let CAP_OK               : u64 = 0
+
+  // Slot out of range (>= CAP_SLOT_MAX). cap_pack refuses to write a
+  // wire record naming a nonexistent cap_table slot; the loader-side
+  // InitCap validator has the mirror check on the receive side.
+  pub let CAP_BAD_SLOT         : u64 = 0xFFFFFFFE
+
+  // Reserved for M2's kind check (kind not in the KIND_TRANSFERABLE
+  // set). M1's cap_pack does not enforce this — a caller can pack any
+  // u16 kind. M2 wires this up alongside cap_manifest_verify's full
+  // logic, at which point cap_pack picks up the same rejection.
+  pub let CAP_BAD_KIND         : u64 = 0xFFFFFFFD
+
+  // cap_manifest_verify: the received cap set is MISSING a cap the
+  // callee's caps.decl requires. Populated by M2-001; M1's skeleton
+  // never returns this.
+  pub let CAP_MANIFEST_MISSING : u64 = 0xFFFFFFFC
+
+  // cap_manifest_verify: the received cap set contains an EXTRA cap
+  // the callee's caps.decl does not name. Populated by M2-001; M1's
+  // skeleton never returns this.
+  pub let CAP_MANIFEST_EXTRA   : u64 = 0xFFFFFFFB
+
+  // ============================================================================
+  // Singleton unpack destination (M1 shape)
+  // ============================================================================
+  //
+  // cap_unpack populates these four slots — the caller reads the fields
+  // it needs directly. This mirrors ParsedArgs' singleton .bss pattern
+  // in libpdx-argv (src/parsed_args.pdx): one unpack per call site is
+  // enough for M1's consumers (the shell + every tool's exec-time
+  // manifest check), and M4 introduces a caller-owned Cap* variant
+  // once multi-cap unpacking becomes real. Consumers depend on the
+  // field NAMES, not on the storage class.
+  pub let mut unpacked_slot       : u64 = uninit @align(8)
+  pub let mut unpacked_kind       : u64 = uninit @align(8)
+  pub let mut unpacked_rights     : u64 = uninit @align(8)
+  pub let mut unpacked_target_ptr : u64 = uninit @align(8)
+
+  // ============================================================================
+  // cap_reset()
+  //
+  // Signature: cap_reset : () -> () !{mem} @{}
+  //
+  // Clear the four unpack slots so a subsequent cap_unpack starts from a
+  // known-zero baseline. The M1 pack+unpack round-trip test in tests/
+  // (added at M4-001) begins with a cap_reset so a botched cap_unpack
+  // that leaves an old value in place is caught rather than masked.
+  //
+  // Leaf function; r11 scratch; no push/pop parity to preserve.
+  // ============================================================================
+  pub let cap_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-cap.M1-001: zero the four unpacked_* slots so cap_unpack starts from a known-empty Cap. xor rax,rax produces the zero constant; four lea+mov pairs write it to each slot. r11 is scratch (paideia-as conformance). Leaf function; no callee-save touched.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + unpacked_slot];       mov [r11], rax;
+        lea r11, [rip + unpacked_kind];       mov [r11], rax;
+        lea r11, [rip + unpacked_rights];     mov [r11], rax;
+        lea r11, [rip + unpacked_target_ptr]; mov [r11], rax;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // cap_pack(dst, slot, kind, rights, target_ptr) -> rc
+  //
+  // Signature: cap_pack : (u64, u64, u64, u64, u64) -> u64 !{mem} @{}
+  // RDI (input): dst        — VA of a 16-byte destination buffer (8-byte aligned)
+  // RSI (input): slot       — 0..CAP_SLOT_MAX-1; else CAP_BAD_SLOT
+  // RDX (input): kind       — KIND_* (u16; caller must have masked)
+  // RCX (input): rights     — RIGHTS_* mask (u32; high bits discarded by shift)
+  // R8  (input): target_ptr — kind-specific u64
+  // RAX (output): CAP_OK on success, else CAP_BAD_SLOT
+  //
+  // Writes exactly 16 bytes to dst as two qwords:
+  //   [dst+0] = (slot & 0xFFFF) | ((kind & 0xFFFF) << 16) | (rights << 32)
+  //   [dst+8] = target_ptr
+  //
+  // Fail-fast on the slot bound; dst is NOT touched on the reject path,
+  // so a caller that recycles a buffer sees its old contents preserved
+  // when pack refuses — same discipline as init_caps_validate returning
+  // BAD_COUNT before touching any downstream state.
+  //
+  // Register plan (leaf, all caller-save):
+  //   rax = qword0 accumulator / return value
+  //   r10 = mask constant (0xFFFF for slot / kind lanes)
+  //   r11 = shifted-field scratch (kind and rights lanes)
+  //   rdi, rsi, rdx, rcx, r8 = untouched inputs
+  // ============================================================================
+  pub let cap_pack : (u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (dst: u64) (slot: u64) (kind: u64) (rights: u64) (target_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-cap.M1-001 cap_pack. Two-qword store: qword0 fuses slot|kind|rights (16+16+32 bits) with a single OR-chain, qword1 is target_ptr. Slot bound: cmp rsi,CAP_SLOT_MAX; jge cap_pack_bad_slot before any write to dst so a rejected pack leaves the caller's buffer untouched. r10 holds the 0xFFFF mask for the slot / kind lanes (both fit in cmp reg,imm ≤ 0x7FFFFFFF); rights lane needs no mask because the shl 32 discards the top 32 bits into the void. r11 is the shifted-field scratch, paideia-as-reserved. Leaf function — no push/pop parity to preserve. Return code CAP_OK (0) or CAP_BAD_SLOT (0xFFFFFFFE); the latter follows InitCap's INIT_CAPS_BAD_SLOT precedent (paideia-os init_caps.pdx) so the two validators return a shared vocabulary.",
+      block: {
+        // Step 1: slot bound. cmp rsi, 256. Fail-fast before any store.
+        cmp rsi, 256;                       // CAP_SLOT_MAX = 256
+        jge cap_pack_bad_slot;
+
+        // Step 2: assemble qword0 = slot | (kind << 16) | (rights << 32).
+        mov r10, 0xFFFF;                    // slot / kind lane mask
+
+        mov rax, rsi;
+        and rax, r10;                       // rax = slot & 0xFFFF (bits 0..15)
+
+        mov r11, rdx;
+        and r11, r10;                       // r11 = kind & 0xFFFF
+        shl r11, 16;                        // r11 = (kind & 0xFFFF) << 16
+        or  rax, r11;                       // rax |= kind lane
+
+        mov r11, rcx;
+        shl r11, 32;                        // r11 = rights << 32 (top 32 bits discarded)
+        or  rax, r11;                       // rax |= rights lane
+
+        // Step 3: store both qwords.
+        mov [rdi + 0], rax;                 // wire[0..7]
+        mov [rdi + 8], r8;                  // wire[8..15] = target_ptr
+
+        xor rax, rax;                       // CAP_OK
+        ret
+
+      cap_pack_bad_slot:
+        mov rax, 0xFFFFFFFE;                // CAP_BAD_SLOT
+        ret
+      }
+    }
+
+  // ============================================================================
+  // cap_unpack(src) -> rc
+  //
+  // Signature: cap_unpack : (u64) -> u64 !{mem} @{}
+  // RDI (input): src — VA of a 16-byte source buffer (8-byte aligned)
+  // RAX (output): CAP_OK (M1 never fails; kind-set validation lands in M2)
+  //
+  // Loads the two qwords and splits qword0 into the three lanes:
+  //   unpacked_slot       = qword0 & 0xFFFF
+  //   unpacked_kind       = (qword0 >> 16) & 0xFFFF
+  //   unpacked_rights     = qword0 >> 32
+  //   unpacked_target_ptr = qword1
+  //
+  // The rights lane needs no mask because `shr rax, 32` naturally zero-
+  // extends the result into the low half — no bits above bit 31 can
+  // survive the shift.
+  //
+  // M1 has no receive-side kind check; M2-003 adds "extra cap → reject"
+  // at which point cap_unpack picks up a CAP_BAD_KIND return path and
+  // stops writing the unpack slots if the kind is not in the callee's
+  // caps.decl.
+  //
+  // Register plan (leaf):
+  //   rax = qword0 accumulator
+  //   r9  = extracted lane value (slot, kind, rights)
+  //   r10 = mask constant (0xFFFF)
+  //   r11 = lea address scratch
+  //   rdi = untouched input
+  // ============================================================================
+  pub let cap_unpack : (u64) -> u64 !{mem} @{} =
+    fn (src: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-cap.M1-001 cap_unpack. Two qword loads: qword0 from [rdi+0] carries the three narrow lanes (slot / kind / rights), qword1 from [rdi+8] carries target_ptr verbatim. Slot lane = qword0 & 0xFFFF; kind lane = (qword0 >> 16) & 0xFFFF; rights lane = qword0 >> 32 (shr zero-extends, no mask needed). Populates the four Cap singleton .bss slots for the caller to read. r11 is scratch (paideia-as conformance) and appears in every lea+mov store; r10 holds the 0xFFFF mask; r9 carries the extracted lane value across the store. Leaf function — no push/pop parity. Round-trip guarantee (baseline test at M4-001): the values written by cap_pack are recovered here byte-for-byte across all four fields.",
+      block: {
+        // Load qword0. Every lane derives from it via mov+shift+mask.
+        mov rax, [rdi + 0];
+
+        // Slot lane: rax & 0xFFFF.
+        mov r10, 0xFFFF;
+        mov r9, rax;
+        and r9, r10;
+        lea r11, [rip + unpacked_slot];
+        mov [r11], r9;
+
+        // Kind lane: (rax >> 16) & 0xFFFF.
+        mov r9, rax;
+        shr r9, 16;
+        and r9, r10;
+        lea r11, [rip + unpacked_kind];
+        mov [r11], r9;
+
+        // Rights lane: rax >> 32. shr naturally zero-extends → no mask.
+        mov r9, rax;
+        shr r9, 32;
+        lea r11, [rip + unpacked_rights];
+        mov [r11], r9;
+
+        // Target_ptr lane: [rdi+8] verbatim.
+        mov r9, [rdi + 8];
+        lea r11, [rip + unpacked_target_ptr];
+        mov [r11], r9;
+
+        xor rax, rax;                       // CAP_OK
+        ret
+      }
+    }
+
+  // ============================================================================
+  // cap_manifest_verify(decl_ptr, received_ptr, received_count) -> rc
+  //
+  // Signature: cap_manifest_verify : (u64, u64, u64) -> u64 !{mem} @{}
+  // RDI (input): decl_ptr       — VA of a CapsDecl-parsed record (see caps_decl.pdx)
+  // RSI (input): received_ptr   — VA of a Cap[] wire array
+  // RDX (input): received_count — number of Caps in received_ptr
+  // RAX (output): CAP_OK | CAP_MANIFEST_MISSING | CAP_MANIFEST_EXTRA
+  //
+  // M1 shape (this milestone): SKELETON only. Returns CAP_OK
+  // unconditionally. The two-way compare (declared vs received, both
+  // by KIND and by narrowed rights) lands in M2-001. M1 exists so
+  // consumers can already wire the exec-time verify call at their
+  // launch site; the enforcement flips on at M2 without a signature
+  // change.
+  //
+  // Reject codes reserved for M2:
+  //   CAP_MANIFEST_MISSING — a required cap is not present in received[]
+  //   CAP_MANIFEST_EXTRA   — a cap in received[] is not named by decl
+  //
+  // Leaf function; no push/pop parity; no state written.
+  // ============================================================================
+  pub let cap_manifest_verify : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (decl_ptr: u64) (received_ptr: u64) (received_count: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-cap.M1-001 cap_manifest_verify skeleton. M1 returns CAP_OK unconditionally so downstream consumers (shell exec path, per-tool startup) can already call the function at the correct site; M2-001 fills the OK | MISSING | EXTRA compare. Signature is frozen at M1 to keep the M2 change diff-only in the body. Leaf function — no push/pop parity, no state written, arguments unused in this milestone (they are documented so the M2 patch is a body edit rather than a signature change).",
+      block: {
+        xor rax, rax;                       // CAP_OK (M2-001 populates the compare)
+        ret
+      }
+    }
+}
