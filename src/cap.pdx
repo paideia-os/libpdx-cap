@@ -96,6 +96,17 @@ module Cap = structure {
   // skeleton never returns this.
   pub let CAP_MANIFEST_EXTRA   : u64 = 0xFFFFFFFB
 
+  // cap_manifest_verify: the caps.decl names a KIND that is not in the
+  // KindNames mirror (see kind_names.pdx). Same numeric value as
+  // KindNames::KIND_NAMES_UNKNOWN — the two constants live in two
+  // modules because KindNames is a leaf Cap depends on and cannot
+  // depend back, but they name the same failure mode. Landed at M2-001.
+  //
+  // Codes 0xFFFFFFFA..0xFFFFFFF6 are reserved for the CapsDecl module
+  // (see design/architecture.md §5). Cap-module error codes extend
+  // downward from 0xFFFFFFF5 (M2+ reservations).
+  pub let CAP_KIND_UNKNOWN     : u64 = 0xFFFFFFF4
+
   // ============================================================================
   // Singleton unpack destination (M1 shape)
   // ============================================================================
@@ -272,30 +283,185 @@ module Cap = structure {
   // cap_manifest_verify(decl_ptr, received_ptr, received_count) -> rc
   //
   // Signature: cap_manifest_verify : (u64, u64, u64) -> u64 !{mem} @{}
-  // RDI (input): decl_ptr       — VA of a CapsDecl-parsed record (see caps_decl.pdx)
-  // RSI (input): received_ptr   — VA of a Cap[] wire array
-  // RDX (input): received_count — number of Caps in received_ptr
+  // RDI (input): decl_ptr       — informational; reserved for M4's
+  //                               caller-owned CapsDecl* variant. M2
+  //                               drives the compare from the CapsDecl
+  //                               singleton (`req_count`, `req_kind_names`)
+  //                               so decl_ptr is ignored in this milestone.
+  //                               Callers pass 0 or a lea(CapsDecl::req_count)
+  //                               and the value is not dereferenced.
+  // RSI (input): received_ptr   — VA of a Cap[] wire array (each record
+  //                               16 bytes, 8-byte aligned).
+  // RDX (input): received_count — number of Cap records in received_ptr.
   // RAX (output): CAP_OK | CAP_MANIFEST_MISSING | CAP_MANIFEST_EXTRA
+  //             | CAP_KIND_UNKNOWN
   //
-  // M1 shape (this milestone): SKELETON only. Returns CAP_OK
-  // unconditionally. The two-way compare (declared vs received, both
-  // by KIND and by narrowed rights) lands in M2-001. M1 exists so
-  // consumers can already wire the exec-time verify call at their
-  // launch site; the enforcement flips on at M2 without a signature
-  // change.
+  // Two-pass compare (M2-001):
+  //   Pass 1 (MISSING): for each declared name in
+  //     `CapsDecl::req_kind_names[0..req_count]`, resolve to an ordinal
+  //     via `KindNames::kind_names_resolve`; if the ordinal is
+  //     KIND_NAMES_UNKNOWN, return CAP_KIND_UNKNOWN (loud fail — a
+  //     caps.decl that names a kind libpdx-cap does not know about is
+  //     a configuration error the tool must surface, not silently
+  //     accept). Otherwise scan received[0..received_count] for a Cap
+  //     whose kind lane equals the ordinal. Miss → CAP_MANIFEST_MISSING.
+  //   Pass 2 (EXTRA): for each received Cap, extract the kind lane and
+  //     scan `CapsDecl::req_kind_names[0..req_count]` for a name whose
+  //     resolved ordinal matches. Miss → CAP_MANIFEST_EXTRA.
   //
-  // Reject codes reserved for M2:
-  //   CAP_MANIFEST_MISSING — a required cap is not present in received[]
-  //   CAP_MANIFEST_EXTRA   — a cap in received[] is not named by decl
+  // Rights-argument text parsing (the (read, subtree=/home) suffix in
+  // caps.decl) is deferred to M3-001 — M2-001 compares by KIND ordinal
+  // only. Rights-mask narrowing at the SEND site lands separately at
+  // M2-002 (cap_pack_narrowed); receive-side extra-cap rejection lands
+  // at M2-003 (cap_unpack_checked). Together the three form the M2 tier.
   //
-  // Leaf function; no push/pop parity; no state written.
+  // Register plan (non-leaf; calls into KindNames::kind_names_resolve):
+  //   r12 = pass 1 outer loop i / pass 2 outer loop i (reused between passes)
+  //   r13 = pass 1 inner scan j / pass 2 inner scan j
+  //   r14 = received_ptr (spilled from rsi; survives nested calls)
+  //   r15 = received_count (spilled from rdx; survives nested calls)
+  //   rbx = pass-2 recv kind held across the inner call
+  //   rax = kind_names_resolve result / return code
+  //   rcx = pass-1 target ord scratch
+  //   r11 = LEA scratch for .bss addresses
+  //
+  // rsp alignment: 5 callee-save pushes (r12/r13/r14/r15/rbx). Entry
+  // rsp % 16 == 8; after 5 pushes (-40 bytes) rsp % 16 == 0 — aligned
+  // for every nested call. No pad slot needed. Matched pops at
+  // epilogue preserve SysV parity.
   // ============================================================================
   pub let cap_manifest_verify : (u64, u64, u64) -> u64 !{mem} @{} =
     fn (decl_ptr: u64) (received_ptr: u64) (received_count: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-cap.M1-001 cap_manifest_verify skeleton. M1 returns CAP_OK unconditionally so downstream consumers (shell exec path, per-tool startup) can already call the function at the correct site; M2-001 fills the OK | MISSING | EXTRA compare. Signature is frozen at M1 to keep the M2 change diff-only in the body. Leaf function — no push/pop parity, no state written, arguments unused in this milestone (they are documented so the M2 patch is a body edit rather than a signature change).",
+      justification: "libpdx-cap.M2-001 cap_manifest_verify. Two-pass compare between CapsDecl::req_kind_names[] (populated by caps_decl_parse) and the received Cap[] array. Pass 1 (MISSING): resolve each declared name to an ordinal via KindNames::kind_names_resolve, then linear-scan received[] for a matching kind lane. Pass 2 (EXTRA): for each received Cap, extract its kind lane and scan the declared names, resolving each against KindNames. Returns CAP_OK, CAP_MANIFEST_MISSING, CAP_MANIFEST_EXTRA, or CAP_KIND_UNKNOWN (if the decl names a kind libpdx-cap does not mirror). decl_ptr is INFORMATIONAL for M2 — the singleton pattern from CapsDecl means the parsed record is at a fixed location; decl_ptr is reserved for the M4 caller-owned variant and is not dereferenced here. Kind lane extraction reuses the M1 shift-and-mask idiom from cap_unpack (qword0 >> 16 & 0xFFFF). paideia-as conformance: r11 is .bss LEA scratch; every cmp reg,imm uses imm ≤ 0x7FFFFFFF (largest is 0xFFFF for the kind mask); no `test` mnemonic; byte reads N/A (all loads are qwords from the wire array). Non-leaf: five callee-save pushes (r12/r13/r14/r15/rbx) → rsp % 16 == 0 at every nested-call site (entry 8; five pushes flip to 0).",
       block: {
-        xor rax, rax;                       // CAP_OK (M2-001 populates the compare)
+        // ---- prologue ------------------------------------------------------
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        push rbx;
+
+        mov r14, rsi;                   // r14 = received_ptr
+        mov r15, rdx;                   // r15 = received_count
+
+        // ==================================================================
+        // Pass 1: for each declared kind name, must appear in received[].
+        // ==================================================================
+        xor r12, r12;                   // i = 0
+
+      _cmv_pass1_head:
+        lea r11, [rip + req_count];
+        mov rax, [r11];
+        cmp r12, rax;
+        jge _cmv_pass2_init;
+
+        // name = CapsDecl::req_kind_names[i]
+        lea r11, [rip + req_kind_names];
+        mov rdi, [r11 + r12*8];
+
+        call kind_names_resolve;
+
+        // Compare rax against CAP_KIND_UNKNOWN (large imm → via r11).
+        mov r11, 0xFFFFFFF4;
+        cmp rax, r11;
+        je _cmv_unknown_kind;
+
+        // rax = target ordinal. Save it and scan received[].
+        mov rcx, rax;                   // rcx = target kind ord
+        xor r13, r13;                   // j = 0
+
+      _cmv_pass1_scan_recv:
+        cmp r13, r15;
+        jge _cmv_missing;
+
+        // recv kind = (received[j].qword0 >> 16) & 0xFFFF
+        mov r8, r14;
+        mov rax, r13;
+        shl rax, 4;                     // j * 16 (Cap record stride)
+        add r8, rax;                    // &received[j]
+        mov rax, [r8];                  // qword0
+        shr rax, 16;
+        and rax, 0xFFFF;
+        cmp rax, rcx;
+        je _cmv_pass1_next_decl;
+
+        add r13, 1;
+        jmp _cmv_pass1_scan_recv;
+
+      _cmv_pass1_next_decl:
+        add r12, 1;
+        jmp _cmv_pass1_head;
+
+        // ==================================================================
+        // Pass 2: for each received Cap, must appear in decl (by kind).
+        // ==================================================================
+      _cmv_pass2_init:
+        xor r12, r12;                   // i = 0 (over received[])
+
+      _cmv_pass2_head:
+        cmp r12, r15;
+        jge _cmv_ok;
+
+        // recv kind = (received[i].qword0 >> 16) & 0xFFFF
+        mov r8, r14;
+        mov rax, r12;
+        shl rax, 4;
+        add r8, rax;
+        mov rax, [r8];
+        shr rax, 16;
+        and rax, 0xFFFF;
+        mov rbx, rax;                   // rbx = current recv kind
+
+        xor r13, r13;                   // j = 0 (over decl)
+
+      _cmv_pass2_scan_decl:
+        lea r11, [rip + req_count];
+        mov rax, [r11];
+        cmp r13, rax;
+        jge _cmv_extra;
+
+        lea r11, [rip + req_kind_names];
+        mov rdi, [r11 + r13*8];
+
+        call kind_names_resolve;
+
+        // Compare returned ordinal against rbx (recv kind).
+        // rbx fits in u16, so no large-imm compare — direct cmp is safe.
+        cmp rax, rbx;
+        je _cmv_pass2_next_recv;
+
+        add r13, 1;
+        jmp _cmv_pass2_scan_decl;
+
+      _cmv_pass2_next_recv:
+        add r12, 1;
+        jmp _cmv_pass2_head;
+
+        // ==================================================================
+        // Exits
+        // ==================================================================
+      _cmv_ok:
+        xor rax, rax;                   // CAP_OK
+        jmp _cmv_epilogue;
+
+      _cmv_missing:
+        mov rax, 0xFFFFFFFC;            // CAP_MANIFEST_MISSING
+        jmp _cmv_epilogue;
+
+      _cmv_extra:
+        mov rax, 0xFFFFFFFB;            // CAP_MANIFEST_EXTRA
+        jmp _cmv_epilogue;
+
+      _cmv_unknown_kind:
+        mov rax, 0xFFFFFFF4;            // CAP_KIND_UNKNOWN
+
+      _cmv_epilogue:
+        pop rbx;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
         ret
       }
     }

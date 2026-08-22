@@ -13,7 +13,8 @@ library in the R49 wave.
 
 ## 1. Public surface
 
-libpdx-cap exposes two modules to its consumers:
+libpdx-cap exposes three modules to its consumers (M2-001 adds the
+`KindNames` module below):
 
 - `Cap` (`src/cap.pdx`) — the wire-format record + three entry points
   every consumer wires at exec:
@@ -23,12 +24,21 @@ libpdx-cap exposes two modules to its consumers:
     populates the `unpacked_*` singleton slots and returns `CAP_OK`.
   - `cap_manifest_verify(decl_ptr, received_ptr, received_count) -> u64`
     — compare a callee's parsed caps.decl against the caps it actually
-    received; returns `CAP_OK | CAP_MANIFEST_MISSING | CAP_MANIFEST_EXTRA`.
-    **M1 ships the skeleton (returns CAP_OK unconditionally); M2-001
-    fills the body.**
+    received; returns `CAP_OK | CAP_MANIFEST_MISSING | CAP_MANIFEST_EXTRA
+    | CAP_KIND_UNKNOWN`. **Body landed at M2-001** (two-pass compare;
+    see §7 below). `decl_ptr` is informational in M2 (the parsed record
+    lives in the singleton); it is reserved for the M4 caller-owned
+    variant. M2-002 and M2-003 add the send-site narrowing helper and
+    the receive-site checked unpack as separate entries — see their
+    respective milestones.
 - `CapsDecl` (`src/caps_decl.pdx`) — the parser for the `caps.decl` text
   file every tool ships at its repo root (per invariant I6). One entry
   point + a singleton record every consumer reads after parse; see §4.
+- `KindNames` (`src/kind_names.pdx`) — a mirror of the paideia-os KIND
+  vocabulary (name → ordinal) covering the R49 tooling wave (14 rows).
+  `kind_names_resolve(name_ptr) -> ord` is the single public entry;
+  used internally by `cap_manifest_verify`. See §7 below for the
+  rationale for keeping the mirror inside libpdx-cap.
 
 The consumer wires libpdx-cap into its own exec path as follows:
 
@@ -177,22 +187,28 @@ wide margin.
 
 ## 5. Return-code vocabulary
 
-Both modules use return codes in the 0xFFFFFFxx range for failures,
+All modules use return codes in the 0xFFFFFFxx range for failures,
 mirroring the InitCap validator's `INIT_CAPS_BAD_*` codes (paideia-os
 `src/kernel/core/loader/init_caps.pdx`). The two families do not
 collide — the InitCap validator's codes name failures during loader
 seed; libpdx-cap's codes name failures during pack/unpack/manifest —
 but a caller that stashes both without tagging can still keep them
-apart by the two-code prefix families this document reserves:
+apart by the code prefix families this document reserves:
 
-- `0xFFFFFFFE / 0xFFFFFFFD` — pack-side (`CAP_BAD_SLOT`, `CAP_BAD_KIND`).
-- `0xFFFFFFFC / 0xFFFFFFFB` — manifest-verify-side (`MISSING`, `EXTRA`).
-- `0xFFFFFFFA .. 0xFFFFFFF6` — caps.decl parser codes (see
+- `0xFFFFFFFE / 0xFFFFFFFD` — Cap pack-side (`CAP_BAD_SLOT`, `CAP_BAD_KIND`).
+- `0xFFFFFFFC / 0xFFFFFFFB` — Cap manifest-verify-side (`MISSING`, `EXTRA`).
+- `0xFFFFFFFA .. 0xFFFFFFF6` — CapsDecl parser codes (see
   `CAPS_DECL_*` in `src/caps_decl.pdx`).
+- `0xFFFFFFF4` — Cap M2-001 / KindNames M2-001
+  (`CAP_KIND_UNKNOWN` / `KIND_NAMES_UNKNOWN`, same numeric value in
+  two modules because KindNames is a leaf Cap can call but not vice
+  versa; each module declares its own copy of the constant with the
+  matching value).
 
-Future codes extend downward from `0xFFFFFFF6`; the sidecar validator
-extends upward from `0xFFFFFFFF` (`INIT_CAPS_BAD_COUNT`). The two
-families cannot collide before the code space is exhausted.
+Future codes extend downward from `0xFFFFFFF4` (M2+ reservations
+appear in the individual `.plans/m2-*-notes.md`); the sidecar
+validator extends upward from `0xFFFFFFFF` (`INIT_CAPS_BAD_COUNT`).
+The two families cannot collide before the code space is exhausted.
 
 ## 6. Compliance with paideia-as encoding constraints
 
@@ -218,15 +234,73 @@ apply to the userspace toolchain at v0.33+:
   leaf — it never calls another function. SysV push/pop parity is
   therefore trivially preserved throughout.
 
-## 7. What M1 explicitly does not do
+## 7. KindNames — the paideia-os KIND vocabulary mirror (M2-001)
+
+`KindNames` (`src/kind_names.pdx`) is the third module libpdx-cap
+ships as of M2. It carries a small MIRROR of paideia-os's
+`src/kernel/core/cap/kind.pdx` — for each of the 14 kinds the R49
+tooling wave actually names in a `caps.decl`, one row (name string
+plus a `mov rax, ord; ret` epilogue). Its single public entry
+`kind_names_resolve(name_ptr) -> ord` is called by
+`Cap::cap_manifest_verify` (both passes) and — once M2-003 lands —
+by `Cap::cap_unpack_checked`.
+
+The 14 mirrored rows (M2 scope):
+
+| ord    | name                    | source in paideia-os cap/kind.pdx |
+|-------:|-------------------------|-----------------------------------|
+| 1      | KIND_PROCESS            | line 60                           |
+| 2      | KIND_THREAD             | line 61                           |
+| 3      | KIND_PAGE_TABLE         | line 62                           |
+| 4      | KIND_PAGE               | line 63 (also KIND_MEMORY alias)  |
+| 4      | KIND_MEMORY             | line 85 (alias of KIND_PAGE)      |
+| 5      | KIND_IPC_ENDPOINT       | line 72 (R20b)                    |
+| 6      | KIND_IPC_PORT           | line 73                           |
+| 8      | KIND_TIMER              | line 87                           |
+| 12     | KIND_NOTIFICATION       | line 91                           |
+| 13     | KIND_REPLY              | line 92                           |
+| 0x190  | KIND_USER               | line 2498 (R48.M1 #1517)          |
+| 0x191  | KIND_ELEVATE_CHANNEL    | line 2533 (R48b substrate-prep)   |
+| 0x195  | KIND_PDXFS_FILE         | line 2566 (R48b substrate-prep)   |
+| 0x196  | KIND_PDXFS_TXN          | line 2596 (R48b substrate-prep)   |
+
+Explicitly NOT in this table (M2 scope):
+
+- **KIND_TTY.** `design/tooling/r49-r50-plan.md` §4.4 lead calls out
+  that its ordinal is "existing, base kind slot in the pre-R48
+  catalogue — softarch Round 2 confirms the ordinal from paideia-os
+  HEAD". paideia-os HEAD has no `KIND_TTY` symbol at the time of M2;
+  the row lands when softarch Round 2 pins the ordinal.
+- Every derived-kind tag above `0x196` (KIND_HW_INTERRUPT and
+  friends). None of them appear in an R49-tool `caps.decl`; when a
+  later-wave tool needs one, a row lands here.
+
+**Miss policy.** If a caps.decl names a kind not in the mirror,
+`kind_names_resolve` returns `KIND_NAMES_UNKNOWN` (`0xFFFFFFF4`), and
+`cap_manifest_verify`'s Pass 1 surfaces the failure as
+`CAP_KIND_UNKNOWN` — a loud, deliberate refusal, NOT a silent success.
+This is safer than the alternative (assume an unknown name resolves
+to a "wildcard" ordinal) because a tool that misspells a kind name in
+its own caps.decl would otherwise ship with a hole in its receive-side
+gate that no compiler would catch.
+
+**Why in-repo instead of caller-supplied.** A caller-supplied resolver
+would decouple libpdx-cap from paideia-os KIND versioning, at the cost
+of every consumer maintaining its own mirror. Since every R49-wave
+tool imports libpdx-cap, keeping ONE mirror here means ONE place to
+update when a new kind lands and ONE place a reviewer inspects for
+correctness. When multi-vendor tools arrive at R51+, an extension
+point (`kind_names_register(name, ord)`) can layer on without
+breaking the current API.
+
+## 8. What M1 explicitly does not do
 
 Called out here so a reader of M1 code does not mistake absence for
 bug:
 
-- **cap_manifest_verify has no body.** M1 ships the skeleton; the
-  actual OK | MISSING | EXTRA compare lands at M2-001. The signature
-  is frozen at M1 so the M2 change is a body-only edit; consumers can
-  already wire the call site.
+- **~~cap_manifest_verify has no body.~~** ✓ Landed at M2-001 (this
+  commit). Two-pass compare against the CapsDecl singleton driven by
+  KindNames — see §7.
 - **No kind-transferable check in cap_pack.** M1 accepts any u16 kind.
   M2-001 wires `CAP_BAD_KIND` up alongside manifest_verify's full logic
   (the two features share the same `KIND_TRANSFERABLE_TABLE` — the

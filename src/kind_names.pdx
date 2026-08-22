@@ -1,0 +1,350 @@
+// src/kind_names.pdx — libpdx-cap.M2-001 supporting module
+// KindNames: static name → ordinal resolver for the caps.decl vocabulary.
+//
+// Design context
+// --------------
+// caps.decl carries KIND names as text ("KIND_TTY", "KIND_PDXFS_FILE"),
+// but received caps carry a u16 kind ordinal on the wire (see
+// design/architecture.md §2). cap_manifest_verify (M2-001 in cap.pdx)
+// has to bridge the two: for every required kind name, resolve to an
+// ordinal, then look for that ordinal in the received cap array.
+//
+// The mapping between name and ordinal is authoritative in paideia-os
+// `src/kernel/core/cap/kind.pdx`. We do NOT re-derive it — libpdx-cap
+// carries a small MIRROR of that table with only the kinds that the
+// R49 tooling wave actually names in a caps.decl. When paideia-os adds
+// a new KIND (or renames one), this table gains a row in a later
+// milestone; until then, a caps.decl that names an unmirrored kind is
+// refused at cap_manifest_verify with CAP_KIND_UNKNOWN — deliberately
+// louder than silently letting the compare succeed on a name we cannot
+// verify.
+//
+// Design tradeoff: a caller-supplied resolver would be more flexible
+// but would move the table's maintenance burden to every consumer.
+// Since every R49-wave tool imports libpdx-cap, keeping the table here
+// gives us ONE place to update when a new kind lands and ONE place a
+// reviewer has to inspect to confirm the vocabulary. When multi-vendor
+// tools arrive at R51+ we can add a `kind_names_register` extension
+// point without breaking the current API.
+//
+// Rows (13 entries, R49 scope):
+//   1  KIND_PROCESS                     (base slot, paideia-os kind.pdx)
+//   2  KIND_THREAD                      (base slot)
+//   3  KIND_PAGE_TABLE                  (base slot)
+//   4  KIND_PAGE / KIND_MEMORY          (base slot; both names → 4)
+//   5  KIND_IPC_ENDPOINT                (base slot; R20b)
+//   6  KIND_IPC_PORT                    (base slot)
+//   8  KIND_TIMER                       (base slot)
+//   12 KIND_NOTIFICATION                (base slot)
+//   13 KIND_REPLY                       (base slot)
+//   0x190 KIND_USER                     (R48.M1 #1517, derived over KIND_HW)
+//   0x191 KIND_ELEVATE_CHANNEL          (R48b substrate-prep #1626)
+//   0x195 KIND_PDXFS_FILE               (R48b substrate-prep #1623)
+//   0x196 KIND_PDXFS_TXN                (R48b substrate-prep #1624)
+//
+// Explicitly NOT in this table:
+//   KIND_TTY  — the plan doc calls out that its ordinal is "existing,
+//     base kind slot in the pre-R48 catalogue" but paideia-os HEAD has
+//     no `KIND_TTY` symbol. When softarch Round 2 confirms the ordinal
+//     (as promised in design/tooling/r49-r50-plan.md §4.4 lead), this
+//     table gains a row; until then a tool declaring KIND_TTY in
+//     caps.decl fails at cap_manifest_verify with CAP_KIND_UNKNOWN
+//     rather than silently succeeding against an assumed ordinal.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module name PascalCase basename (`KindNames`), no directory prefix.
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses immediate ≤ 0x7FFFFFFF. The largest
+//     literal ordinal (0x196 = 406) fits by wide margin. The
+//     CAP_KIND_UNKNOWN sentinel (0xFFFFFFF4) is a `mov rax, imm32`
+//     store — the same precedent InitCap's `INIT_CAPS_BAD_*` codes
+//     use — never a compare imm.
+//   - r11 is scratch (paideia-as-reserved). `_cap_cstr_eq` is a leaf
+//     helper; `kind_names_resolve` uses r12 as callee-save to hold the
+//     input name pointer across nested calls to `_cap_cstr_eq`.
+//   - Byte reads use `xor rax, rax; mov_b rax, [ptr]` per #1248.
+//   - `_cap_cstr_eq` is a leaf (no nested calls); `kind_names_resolve`
+//     does exactly one push (r12) → rsp % 16 == 0 at every nested-call
+//     site, matching the paideia-as SysV rsp alignment invariant.
+
+module KindNames = structure {
+
+  // ============================================================================
+  // Sentinel returned when a name is not in the mirrored table.
+  //
+  // Same numeric value as Cap::CAP_KIND_UNKNOWN below (0xFFFFFFF4). The
+  // duplication is intentional: KindNames MUST not include cap.pdx (it
+  // is a leaf module Cap can call, not vice versa), and hard-coding the
+  // sentinel here matches the InitCap-family error-code convention
+  // where each module writes its own return-code constants.
+  // ============================================================================
+  pub let KIND_NAMES_UNKNOWN : u64 = 0xFFFFFFF4
+
+  // ============================================================================
+  // Name strings (.rodata). One NUL-terminated ASCII literal per row.
+  // Every array length is EXACTLY the character count + 1 for NUL, so a
+  // caller-side sizeof reads back the wire length used by the parser.
+  // ============================================================================
+
+  pub let _kn_str_process         : [u8; 13] = "KIND_PROCESS\0"
+  pub let _kn_str_thread          : [u8; 12] = "KIND_THREAD\0"
+  pub let _kn_str_page_table      : [u8; 16] = "KIND_PAGE_TABLE\0"
+  pub let _kn_str_page            : [u8; 10] = "KIND_PAGE\0"
+  pub let _kn_str_memory          : [u8; 12] = "KIND_MEMORY\0"
+  pub let _kn_str_ipc_endpoint    : [u8; 18] = "KIND_IPC_ENDPOINT\0"
+  pub let _kn_str_ipc_port        : [u8; 14] = "KIND_IPC_PORT\0"
+  pub let _kn_str_timer           : [u8; 11] = "KIND_TIMER\0"
+  pub let _kn_str_notification    : [u8; 18] = "KIND_NOTIFICATION\0"
+  pub let _kn_str_reply           : [u8; 11] = "KIND_REPLY\0"
+  pub let _kn_str_user            : [u8; 10] = "KIND_USER\0"
+  pub let _kn_str_elevate_channel : [u8; 21] = "KIND_ELEVATE_CHANNEL\0"
+  pub let _kn_str_pdxfs_file      : [u8; 16] = "KIND_PDXFS_FILE\0"
+  pub let _kn_str_pdxfs_txn       : [u8; 15] = "KIND_PDXFS_TXN\0"
+
+  // ============================================================================
+  // _cap_cstr_eq(a, b) -> rc
+  //
+  // Signature: _cap_cstr_eq : (u64, u64) -> u64 !{mem} @{}
+  // RDI (input): a — VA of a NUL-terminated ASCII string
+  // RSI (input): b — VA of a NUL-terminated ASCII string
+  // RAX (output): 0 if the two strings compare equal (both terminate at
+  //               the same byte offset with identical bytes before), 1
+  //               otherwise.
+  //
+  // Leaf function; no push/pop parity to preserve; r11 unused (no .bss
+  // touch). Byte reads use the paideia-as #1248 pattern:
+  // `xor rax, rax; mov_b rax, [ptr]`.
+  //
+  // Register plan:
+  //   rax = a-byte load / return value
+  //   rcx = b-byte load
+  //   rdi = a cursor (advanced in-place)
+  //   rsi = b cursor (advanced in-place)
+  //
+  // rdi and rsi are caller-save — advancing them in-place is safe and
+  // saves the two `mov` instructions that would otherwise thread them
+  // through a scratch reg per iteration.
+  // ============================================================================
+  pub let _cap_cstr_eq : (u64, u64) -> u64 !{mem} @{} =
+    fn (a: u64) (b: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-cap.M2-001 _cap_cstr_eq. Byte-by-byte C-string compare used only by kind_names_resolve to match a caps.decl-parsed identifier (NUL-terminated in place by CapsDecl::caps_decl_parse) against one of the KindNames table entries. Leaf function; no callee-save touched; #1248-safe byte loads via xor rax,rax; mov_b rax,[rdi] then xor rcx,rcx; mov_b rcx,[rsi]. Terminates on first mismatch (rc=1) or on both-NUL agreement (rc=0). rdi and rsi are caller-save and are advanced in place — the caller sees them at their post-walk positions if it inspects them, which no current caller does. paideia-as conformance: r11 unused, no cmp reg,imm > 0x7FFFFFFF (the only immediates are 0 and 1), no `test` mnemonic.",
+      block: {
+      _kncmp_head:
+        xor rax, rax;
+        mov_b rax, [rdi];
+        xor rcx, rcx;
+        mov_b rcx, [rsi];
+        cmp rax, rcx;
+        jne _kncmp_neq;
+        cmp rax, 0;
+        je _kncmp_eq;
+        add rdi, 1;
+        add rsi, 1;
+        jmp _kncmp_head;
+      _kncmp_eq:
+        xor rax, rax;
+        ret;
+      _kncmp_neq:
+        mov rax, 1;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // kind_names_resolve(name_ptr) -> ord
+  //
+  // Signature: kind_names_resolve : (u64) -> u64 !{mem} @{}
+  // RDI (input): name_ptr — VA of a NUL-terminated identifier from the
+  //                         caller's caps.decl parse (typically an entry
+  //                         of CapsDecl::req_kind_names, interior into
+  //                         the source buffer, NUL-terminated in place
+  //                         by CapsDecl::caps_decl_parse).
+  // RAX (output): kind ordinal on hit (see table at top of file), or
+  //               KIND_NAMES_UNKNOWN (0xFFFFFFF4) on miss.
+  //
+  // Implementation: linear scan of the 14 mirrored rows above, one
+  // _cap_cstr_eq call per candidate. The row set is tiny (a caps.decl
+  // has at most 16 entries, and the KindNames table has 14 rows), so
+  // the linear scan runs in constant expected time on the hot path.
+  // A hash-lookup accelerator can land at M4 alongside the round-trip
+  // fuzz if profile data justifies it.
+  //
+  // Register plan:
+  //   r12 = name_ptr (callee-save; survives every nested call so we do
+  //         NOT reload rdi from a spill slot between rows)
+  //   rdi = name_ptr (reloaded from r12 before each nested call)
+  //   rsi = candidate row (lea from .rodata)
+  //   rax = _cap_cstr_eq result / return value
+  //
+  // rsp alignment: one push (r12) at prologue → rsp % 16 == 0 at every
+  // nested-call site (entry rsp % 16 == 8; one push flips to 0). No pad
+  // needed.
+  // ============================================================================
+  pub let kind_names_resolve : (u64) -> u64 !{mem} @{} =
+    fn (name_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-cap.M2-001 kind_names_resolve. Linear scan of the 14-row R49 KindNames mirror. r12 (callee-save) holds name_ptr across every _cap_cstr_eq call so we do not need a stack spill slot; each row reloads rdi from r12 before the call. One push (r12) at prologue keeps rsp % 16 == 0 at each nested-call site (entry 8; push flips to 0). Hit paths mov the ordinal into rax and fall through to the shared epilogue; the KIND_NAMES_UNKNOWN sentinel (0xFFFFFFF4, same numeric value as Cap::CAP_KIND_UNKNOWN below) is loaded via `mov rax, imm32` — the InitCap-BAD_KIND precedent for 0xFFFFFFxx return codes. paideia-as conformance: no cmp reg,imm > 0x7FFFFFFF (the only immediate compare is `cmp rax, 0` for the _cap_cstr_eq result); r11 unused (KindNames has no .bss); no `test` mnemonic. The KIND_PAGE and KIND_MEMORY names both resolve to ordinal 4 — the base-slot alias documented at kind.pdx line 85 (KIND_MEMORY = KIND_PAGE = 4).",
+      block: {
+        push r12;
+        mov r12, rdi;
+
+        // Row 01: KIND_PROCESS
+        mov rdi, r12;
+        lea rsi, [rip + _kn_str_process];
+        call _cap_cstr_eq;
+        cmp rax, 0;
+        je _knres_hit_process;
+
+        // Row 02: KIND_THREAD
+        mov rdi, r12;
+        lea rsi, [rip + _kn_str_thread];
+        call _cap_cstr_eq;
+        cmp rax, 0;
+        je _knres_hit_thread;
+
+        // Row 03: KIND_PAGE_TABLE
+        mov rdi, r12;
+        lea rsi, [rip + _kn_str_page_table];
+        call _cap_cstr_eq;
+        cmp rax, 0;
+        je _knres_hit_page_table;
+
+        // Row 04: KIND_PAGE
+        mov rdi, r12;
+        lea rsi, [rip + _kn_str_page];
+        call _cap_cstr_eq;
+        cmp rax, 0;
+        je _knres_hit_page;
+
+        // Row 05: KIND_MEMORY (alias of KIND_PAGE)
+        mov rdi, r12;
+        lea rsi, [rip + _kn_str_memory];
+        call _cap_cstr_eq;
+        cmp rax, 0;
+        je _knres_hit_page;
+
+        // Row 06: KIND_IPC_ENDPOINT
+        mov rdi, r12;
+        lea rsi, [rip + _kn_str_ipc_endpoint];
+        call _cap_cstr_eq;
+        cmp rax, 0;
+        je _knres_hit_ipc_endpoint;
+
+        // Row 07: KIND_IPC_PORT
+        mov rdi, r12;
+        lea rsi, [rip + _kn_str_ipc_port];
+        call _cap_cstr_eq;
+        cmp rax, 0;
+        je _knres_hit_ipc_port;
+
+        // Row 08: KIND_TIMER
+        mov rdi, r12;
+        lea rsi, [rip + _kn_str_timer];
+        call _cap_cstr_eq;
+        cmp rax, 0;
+        je _knres_hit_timer;
+
+        // Row 09: KIND_NOTIFICATION
+        mov rdi, r12;
+        lea rsi, [rip + _kn_str_notification];
+        call _cap_cstr_eq;
+        cmp rax, 0;
+        je _knres_hit_notification;
+
+        // Row 10: KIND_REPLY
+        mov rdi, r12;
+        lea rsi, [rip + _kn_str_reply];
+        call _cap_cstr_eq;
+        cmp rax, 0;
+        je _knres_hit_reply;
+
+        // Row 11: KIND_USER
+        mov rdi, r12;
+        lea rsi, [rip + _kn_str_user];
+        call _cap_cstr_eq;
+        cmp rax, 0;
+        je _knres_hit_user;
+
+        // Row 12: KIND_ELEVATE_CHANNEL
+        mov rdi, r12;
+        lea rsi, [rip + _kn_str_elevate_channel];
+        call _cap_cstr_eq;
+        cmp rax, 0;
+        je _knres_hit_elevate_channel;
+
+        // Row 13: KIND_PDXFS_FILE
+        mov rdi, r12;
+        lea rsi, [rip + _kn_str_pdxfs_file];
+        call _cap_cstr_eq;
+        cmp rax, 0;
+        je _knres_hit_pdxfs_file;
+
+        // Row 14: KIND_PDXFS_TXN
+        mov rdi, r12;
+        lea rsi, [rip + _kn_str_pdxfs_txn];
+        call _cap_cstr_eq;
+        cmp rax, 0;
+        je _knres_hit_pdxfs_txn;
+
+        // No match — return the KIND_NAMES_UNKNOWN sentinel.
+        mov rax, 0xFFFFFFF4;
+        pop r12;
+        ret;
+
+      _knres_hit_process:
+        mov rax, 1;
+        pop r12;
+        ret;
+      _knres_hit_thread:
+        mov rax, 2;
+        pop r12;
+        ret;
+      _knres_hit_page_table:
+        mov rax, 3;
+        pop r12;
+        ret;
+      _knres_hit_page:
+        mov rax, 4;
+        pop r12;
+        ret;
+      _knres_hit_ipc_endpoint:
+        mov rax, 5;
+        pop r12;
+        ret;
+      _knres_hit_ipc_port:
+        mov rax, 6;
+        pop r12;
+        ret;
+      _knres_hit_timer:
+        mov rax, 8;
+        pop r12;
+        ret;
+      _knres_hit_notification:
+        mov rax, 12;
+        pop r12;
+        ret;
+      _knres_hit_reply:
+        mov rax, 13;
+        pop r12;
+        ret;
+      _knres_hit_user:
+        mov rax, 0x190;
+        pop r12;
+        ret;
+      _knres_hit_elevate_channel:
+        mov rax, 0x191;
+        pop r12;
+        ret;
+      _knres_hit_pdxfs_file:
+        mov rax, 0x195;
+        pop r12;
+        ret;
+      _knres_hit_pdxfs_txn:
+        mov rax, 0x196;
+        pop r12;
+        ret
+      }
+    }
+}
