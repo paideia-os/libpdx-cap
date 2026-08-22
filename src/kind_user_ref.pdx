@@ -1,0 +1,352 @@
+// src/kind_user_ref.pdx — libpdx-cap.M3-001
+// KindUserRef: KIND_USER wire-cap decode + owner-column hex rendering.
+//
+// Design context
+// --------------
+// Per design/tooling/r49-r50-plan.md §4.4 in paideia-os, `ls --long`
+// renders each entry's owner as a KIND_USER_ref — a *capability
+// reference*, not a text uid. The Cap arrives on the wire in the M1
+// 16-byte layout (see cap.pdx §Record layout); its `target_ptr` (low
+// 16 bits) is the KIND_USER row_id per paideia-os
+// src/kernel/core/cap/kind_user.pdx line 950 ("target_ptr = row_id").
+//
+// `KindUserRef` bridges the wire form and the userspace consumer:
+//   1) `kind_user_ref_decode(wire_ptr)` verifies the record is a
+//      KIND_USER cap (kind lane == 0x190), extracts row_id + slot +
+//      rights + the raw target_ptr into a singleton in .bss, and
+//      fails loudly if the kind is wrong (WRONG_KIND) or the row_id
+//      is outside [0, USER_MAX=16) (BAD_ROW). On WRONG_KIND the
+//      singleton is left untouched — same fail-fast discipline as
+//      cap_unpack_checked (M2-003).
+//   2) `kind_user_ref_render_hex(user_key)` renders a fingerprint
+//      word (typically obtained by invoking the cap with
+//      USER_OP_QUERY_FP0 from the paideia-os kernel's cap_handler_user
+//      at kind_user.pdx line 1122) as 16 lowercase hex digits in a
+//      NUL-terminated buffer. `ls --long` places this string in its
+//      owner column.
+//
+// The decode + render split is deliberate. `kind_user_ref_decode` is
+// a pure wire-format inspection — no syscall, no cap invocation, no
+// dependency on the kernel's user_table state. `kind_user_ref_render_hex`
+// is a pure formatting function — no syscall either. The middle step
+// (obtaining the fingerprint from the row_id via a
+// KIND_USER cap invocation) is the CALLER's responsibility because
+// it needs a cap handle libpdx-cap does not own. This keeps the
+// library dependency-free and testable in isolation, and lets the
+// consumer batch fingerprint queries across N ls entries in a single
+// syscall pass at a later milestone.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module name PascalCase basename (`KindUserRef`), no directory
+//     prefix.
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses immediate ≤ 0x7FFFFFFF (largest is
+//     0xFFFF for the kind mask; 0x190 for the KIND_USER compare; 16
+//     for the USER_MAX bound).
+//   - r11 is scratch (paideia-as-reserved) — used for every
+//     `lea r11, [rip + sym]` store.
+//   - Byte reads (in kind_user_ref_render_hex, when indexing the
+//     hex-digit table) use `xor rax, rax; mov_b rax, [ptr]` per the
+//     #1248 mitigation. Byte writes to the output buffer use
+//     `mov_b [ptr], reg` (the mirror pattern from
+//     caps_decl.pdx's NUL-terminate stores).
+//   - Both entry points are LEAF — no callee-save touched, no
+//     push/pop parity to preserve, no nested-call rsp % 16 == 0
+//     obligation. `kind_user_ref_render_hex` uses only caller-save
+//     regs across its 16-iteration loop.
+//   - `_knres_hit_user` in kind_names.pdx already returns 0x190 as
+//     an imm32 move (mov rax, 0x190); we mirror that literal here
+//     for the compare (`cmp r8, 0x190`), which fits every ×86 imm32
+//     slot without staging.
+
+module KindUserRef = structure {
+
+  // ============================================================================
+  // Kind ordinal we expect on decode. Mirrors paideia-os
+  // src/kernel/core/cap/kind_user.pdx line 122 (`KIND_USER = 0x190`)
+  // and KindNames::_knres_hit_user's return value.
+  // ============================================================================
+  pub let KIND_USER : u64 = 0x190
+
+  // ============================================================================
+  // USER_MAX bound. Same numeric value as paideia-os KindUser::USER_MAX
+  // (16 rows per _user_table). A wire cap presenting a row_id ≥ 16 is
+  // malformed and is refused with USER_REF_BAD_ROW; this catches the
+  // sentinel USER_ROW_NONE (0xFF) and every other out-of-band value in
+  // the same compare.
+  // ============================================================================
+  pub let USER_MAX : u64 = 16
+
+  // ============================================================================
+  // Return codes
+  //
+  // Range 0xFFFFFFF3..0xFFFFFFF2 reserved for KindUserRef per
+  // design/architecture.md §5 (the code-space owned by the library
+  // extends downward from 0xFFFFFFF4 = CAP_KIND_UNKNOWN, KindUserRef
+  // taking the next two slots below).
+  // ============================================================================
+
+  // Success. `user_ref_*` singleton slots are populated.
+  pub let USER_REF_OK         : u64 = 0
+
+  // Wire kind lane != KIND_USER (0x190). Singleton is UNTOUCHED — same
+  // fail-fast discipline as cap_unpack_checked's CAP_MANIFEST_EXTRA
+  // path (M2-003 leaves unpacked_* alone when the received kind is
+  // outside the callee's caps.decl vocabulary).
+  pub let USER_REF_WRONG_KIND : u64 = 0xFFFFFFF3
+
+  // Wire target_ptr's low-16 lane is not a legal row_id — either it is
+  // the USER_ROW_NONE sentinel (0xFF from kind_user.pdx line 158) or
+  // any value ≥ USER_MAX. Singleton is UNTOUCHED so the caller sees
+  // the previous decode's values preserved and can distinguish a
+  // rejected decode from a successful one without a defensive reset.
+  pub let USER_REF_BAD_ROW    : u64 = 0xFFFFFFF2
+
+  // ============================================================================
+  // Singleton decode destination (M3 shape)
+  //
+  // kind_user_ref_decode populates these four slots — the caller reads
+  // the fields it needs directly. This mirrors Cap::unpacked_* and
+  // CapsDecl's singleton pattern: one decode per call site is enough
+  // for `ls --long`'s row-by-row rendering (each row invokes the
+  // KIND_USER cap synchronously and formats the fingerprint before
+  // moving to the next row).
+  //
+  // `user_ref_row_id`     — kernel row index into paideia-os _user_table
+  //                         (0..15). Caller invokes the KIND_USER cap
+  //                         with USER_OP_QUERY_FP0 to obtain the
+  //                         fingerprint word associated with this row.
+  // `user_ref_slot`       — cap_table slot the wire record targeted.
+  // `user_ref_rights`     — RIGHTS_* mask the wire record carried.
+  // `user_ref_raw_target` — full 64-bit target_ptr, preserved verbatim
+  //                         so a future extension (e.g. an inline
+  //                         fingerprint tail once kernel widens
+  //                         KIND_USER's wire encoding) can read the
+  //                         high bits without re-decoding.
+  // ============================================================================
+  pub let mut user_ref_row_id     : u64 = uninit @align(8)
+  pub let mut user_ref_slot       : u64 = uninit @align(8)
+  pub let mut user_ref_rights     : u64 = uninit @align(8)
+  pub let mut user_ref_raw_target : u64 = uninit @align(8)
+
+  // ============================================================================
+  // Hex-render output buffer (17 bytes: 16 hex digits + '\0').
+  //
+  // `kind_user_ref_render_hex(user_key)` writes into this buffer as
+  // lowercase big-endian ASCII (MSN first). The buffer is @align(8) so
+  // the eight-byte prefix can be qword-loaded by a downstream `puts`
+  // implementation without a byte-oriented gather.
+  //
+  // The 17-byte size is deliberate: 16 hex digits render one u64
+  // exactly, and the trailing '\0' lets a C-string consumer walk the
+  // buffer without a caller-supplied length. `ls --long`'s owner
+  // column uses the whole 16-digit form; a compressed "first eight
+  // digits + ellipsis" form is a display-layer choice the caller
+  // makes on the 17-byte source of truth here.
+  // ============================================================================
+  pub let mut user_ref_hex_buf : [u8; 17] = uninit @align(8)
+
+  // ============================================================================
+  // ASCII hex-digit table (lowercase). 17 bytes including terminating
+  // NUL so a paideia-as `[u8; N]` literal can carry it in .rodata with
+  // the same conventions as KindNames' name strings.
+  // ============================================================================
+  pub let _kur_hex : [u8; 17] = "0123456789abcdef\0"
+
+  // ============================================================================
+  // kind_user_ref_reset()
+  //
+  // Signature: kind_user_ref_reset : () -> () !{mem} @{}
+  //
+  // Clear the four singleton slots so a subsequent kind_user_ref_decode
+  // starts from a known-zero baseline. `ls --long`'s row-by-row
+  // rendering loop calls reset once before each row to guard against
+  // a rejected decode masking the previous row's values under a
+  // caller bug.
+  //
+  // Leaf function; r11 scratch; no push/pop parity to preserve.
+  // ============================================================================
+  pub let kind_user_ref_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-cap.M3-001 kind_user_ref_reset. Zero the four user_ref_* singleton slots so kind_user_ref_decode starts from a known-empty baseline. xor rax,rax produces the zero constant; four lea+mov pairs write it to each slot. Mirrors cap_reset (cap.pdx M1-001) and caps_decl_reset (caps_decl.pdx M1-002). r11 is scratch (paideia-as conformance). Leaf function; no callee-save touched.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + user_ref_row_id];     mov [r11], rax;
+        lea r11, [rip + user_ref_slot];       mov [r11], rax;
+        lea r11, [rip + user_ref_rights];     mov [r11], rax;
+        lea r11, [rip + user_ref_raw_target]; mov [r11], rax;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // kind_user_ref_decode(cap_wire_ptr) -> rc
+  //
+  // Signature: kind_user_ref_decode : (u64) -> u64 !{mem} @{}
+  // RDI (input): cap_wire_ptr — VA of a 16-byte Cap wire record
+  //                             (8-byte aligned; same layout as
+  //                             cap_unpack's src).
+  // RAX (output): USER_REF_OK | USER_REF_WRONG_KIND | USER_REF_BAD_ROW
+  //
+  // On USER_REF_OK, the four singleton slots hold:
+  //   user_ref_row_id     = target_ptr & 0xFFFF   (kernel row index)
+  //   user_ref_slot       = qword0 & 0xFFFF        (cap_table slot)
+  //   user_ref_rights     = qword0 >> 32           (RIGHTS_* mask)
+  //   user_ref_raw_target = full qword1            (target_ptr verbatim)
+  //
+  // On USER_REF_WRONG_KIND or USER_REF_BAD_ROW, the singleton is
+  // UNTOUCHED — fail-fast, matching cap_unpack_checked's discipline
+  // (M2-003 §_cuc_extra). A caller inspecting `user_ref_row_id` after
+  // a rejected decode sees the previous decode's value (or 0 if
+  // kind_user_ref_reset was called first), NOT stale garbage from
+  // the rejected wire record.
+  //
+  // Register plan (leaf; no callee-save touched, no nested calls):
+  //   rax = qword0 accumulator / return code
+  //   r8  = kind lane extraction / rights extraction
+  //   r9  = qword1 (target_ptr) accumulator
+  //   r10 = mask constant (0xFFFF) — shared across all three narrow
+  //         lane extractions
+  //   rdx = row_id / interim
+  //   rcx = slot lane
+  //   r11 = LEA scratch for the four .bss stores at the OK epilogue
+  // ============================================================================
+  pub let kind_user_ref_decode : (u64) -> u64 !{mem} @{} =
+    fn (cap_wire_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-cap.M3-001 kind_user_ref_decode. Wire-cap inspection: extracts the kind lane from qword0 and verifies it names KIND_USER (0x190). If wrong, refuses with USER_REF_WRONG_KIND and leaves the four user_ref_* singleton slots UNTOUCHED — same fail-fast discipline as cap_unpack_checked's CAP_MANIFEST_EXTRA path (M2-003). If correct, extracts row_id from target_ptr's low-16 lane and verifies row_id < USER_MAX (16); an out-of-band value (including USER_ROW_NONE = 0xFF) refuses with USER_REF_BAD_ROW, again leaving the singleton untouched. On acceptance, populates the four singleton slots with (row_id, slot, rights, raw_target) and returns USER_REF_OK. Kind lane and slot lane share the 0xFFFF mask constant staged in r10; rights extraction uses shr 32 which zero-extends naturally. paideia-as conformance: every cmp reg,imm uses imm ≤ 0xFFFF (0x190 for the KIND_USER compare and 16 for the USER_MAX bound both fit trivially); r11 is .bss LEA scratch; no `test` mnemonic; no byte reads (all wire loads are qwords). Leaf function; no push/pop parity to preserve; no nested-call rsp alignment obligation.",
+      block: {
+        // Load qword0 = slot | (kind << 16) | (rights << 32).
+        mov rax, [rdi + 0];
+
+        // Extract kind lane = (qword0 >> 16) & 0xFFFF.
+        mov r8, rax;
+        shr r8, 16;
+        mov r10, 0xFFFF;
+        and r8, r10;
+
+        // Verify kind == KIND_USER (0x190).
+        cmp r8, 0x190;
+        jne _kur_dec_wrong_kind;
+
+        // Load qword1 (target_ptr).
+        mov r9, [rdi + 8];
+
+        // Extract row_id = target_ptr & 0xFFFF.
+        mov rdx, r9;
+        and rdx, r10;
+
+        // Verify row_id < USER_MAX (16). Catches USER_ROW_NONE (0xFF)
+        // and every other out-of-band value in one compare.
+        cmp rdx, 16;
+        jge _kur_dec_bad_row;
+
+        // Extract slot lane = qword0 & 0xFFFF.
+        mov rcx, rax;
+        and rcx, r10;
+
+        // Extract rights lane = qword0 >> 32.
+        mov r8, rax;
+        shr r8, 32;
+
+        // Populate singleton slots. r11 = LEA scratch per store.
+        lea r11, [rip + user_ref_row_id];     mov [r11], rdx;
+        lea r11, [rip + user_ref_slot];       mov [r11], rcx;
+        lea r11, [rip + user_ref_rights];     mov [r11], r8;
+        lea r11, [rip + user_ref_raw_target]; mov [r11], r9;
+
+        xor rax, rax;                       // USER_REF_OK
+        ret;
+
+      _kur_dec_wrong_kind:
+        mov rax, 0xFFFFFFF3;                // USER_REF_WRONG_KIND
+        ret;
+
+      _kur_dec_bad_row:
+        mov rax, 0xFFFFFFF2;                // USER_REF_BAD_ROW
+        ret
+      }
+    }
+
+  // ============================================================================
+  // kind_user_ref_render_hex(user_key) -> len
+  //
+  // Signature: kind_user_ref_render_hex : (u64) -> u64 !{mem} @{}
+  // RDI (input): user_key — a u64 fingerprint word (typically
+  //                         pk_fingerprint word 0 obtained by invoking
+  //                         a KIND_USER cap with USER_OP_QUERY_FP0
+  //                         per paideia-os kind_user.pdx line 133).
+  // RAX (output): 16 — always. The literal size of the hex encoding.
+  //                    A u64 renders to exactly 16 hex digits; the
+  //                    return exists so the caller does not have to
+  //                    strlen the buffer.
+  //
+  // Writes 16 lowercase hex digits (MSN first) into `user_ref_hex_buf`
+  // followed by a NUL at byte 16 — 17 bytes total consumed. The buffer
+  // is @align(8) so a downstream qword-oriented consumer can slurp
+  // the first 8 or all 16 digits without a byte-oriented copy.
+  //
+  // Algorithm: shift-left-by-4 loop, 16 iterations. Each iteration
+  // extracts the top nibble via `shr rax, 60`, indexes _kur_hex to
+  // fetch the ASCII digit, stores the byte at [hex_buf + i], then
+  // shifts the value left by 4 to bring the next nibble to the top.
+  // The loop terminates on rcx == 16.
+  //
+  // Register plan (leaf; no callee-save touched, no nested calls):
+  //   rax = digit-index scratch / ASCII byte
+  //   rcx = loop counter i (0..15)
+  //   r8  = _kur_hex base (loaded once at prologue)
+  //   r9  = user_ref_hex_buf base (loaded once at prologue)
+  //   r10 = shifting copy of user_key (advances left-by-4 per iter)
+  //   r11 = per-store LEA scratch (address of hex_buf[i] and hex[nib])
+  // ============================================================================
+  pub let kind_user_ref_render_hex : (u64) -> u64 !{mem} @{} =
+    fn (user_key: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-cap.M3-001 kind_user_ref_render_hex. Renders a u64 fingerprint word as 16 lowercase hex digits (MSN first) into user_ref_hex_buf, then writes a NUL at byte 16. 16-iteration loop: each iteration extracts the current top nibble via `mov rax, r10; shr rax, 60` (shr naturally zero-extends so no mask needed — the nibble sits in bits [3:0] of rax), indexes _kur_hex[nibble] via `add r11, rax; xor rax, rax; mov_b rax, [r11]` (#1248-safe byte read), then stores the ASCII byte at hex_buf[i] via `mov_b [r11], rax`. r10 shifts left by 4 at the end of each iteration to bring the next nibble to the top. Loop terminates on `cmp rcx, 16; jge _kur_hex_done` — 16 fits imm ≤ 0x7FFFFFFF trivially. Return value 16 is the literal digit count so the caller does not have to strlen. paideia-as conformance: shr rax,60 uses imm8 60 (< 128, valid shift immediate); every cmp reg,imm uses tiny imms; r11 is scratch for both loads and stores; byte reads use xor rax,rax; mov_b rax,[r11]; byte writes use mov_b [r11], rax (mirror pattern from caps_decl.pdx NUL-terminate stores). No `test` mnemonic. Leaf function; no push/pop parity to preserve.",
+      block: {
+        lea r8, [rip + _kur_hex];           // r8 = digit table base
+        lea r9, [rip + user_ref_hex_buf];   // r9 = output buffer base
+        mov r10, rdi;                       // r10 = value being rendered
+        xor rcx, rcx;                       // rcx = i = 0
+
+      _kur_hex_loop:
+        cmp rcx, 16;
+        jge _kur_hex_done;
+
+        // Extract top nibble = (r10 >> 60) & 0xF. shr naturally
+        // zero-extends so no explicit mask is required.
+        mov rax, r10;
+        shr rax, 60;
+
+        // Fetch ASCII digit = _kur_hex[nibble]. #1248-safe byte read.
+        mov r11, r8;
+        add r11, rax;
+        xor rax, rax;
+        mov_b rax, [r11];
+
+        // Store digit at user_ref_hex_buf[i].
+        mov r11, r9;
+        add r11, rcx;
+        mov_b [r11], rax;
+
+        // Advance: bring next nibble to top, increment i.
+        shl r10, 4;
+        add rcx, 1;
+        jmp _kur_hex_loop;
+
+      _kur_hex_done:
+        // Write NUL at byte 16.
+        mov r11, r9;
+        add r11, 16;
+        xor rax, rax;
+        mov_b [r11], rax;
+
+        // Return literal 16 (digit count).
+        mov rax, 16;
+        ret
+      }
+    }
+}

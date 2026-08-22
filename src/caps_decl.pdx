@@ -535,4 +535,349 @@ module CapsDecl = structure {
         ret
       }
     }
+
+  // ============================================================================
+  // M3-001 — rights-args-text refinement helpers
+  //
+  // At M1-002 the parser stored the pointer to the '(' byte of every
+  // list-item args-text in `req_args_texts[k]`, but never inspected
+  // the interior. M2 compared caps by KIND ordinal alone; the
+  // (read, subtree=/home) suffix was untouched. M3-001 lifts the
+  // interior into a query API so cp/mv/rm can compare the received
+  // rights-args against the callee's declared refinements without
+  // each consumer re-implementing the tokenizer.
+  //
+  // Grammar of the args-text (subset covering R49-wave consumers):
+  //
+  //   args-text = '(' token ( ',' SPACES? token )* ')'
+  //   token     = bare-ident              // e.g. "read", "write"
+  //             | key '=' value           // e.g. "subtree=/home"
+  //   key       = IDENT
+  //   value     = VCHAR*                  // stops at ',', ')', ws, or EOF
+  //
+  // The two entry points below are the only surface a consumer needs:
+  //
+  //   caps_decl_args_has(args_ptr, needle_ptr) -> 0 | 1
+  //     Bare-token membership. Returns 1 iff `needle` appears as a
+  //     comma-separated token inside `args_ptr`'s parentheses.
+  //     Whitespace inside the parentheses is skipped. Matching is
+  //     byte-exact and case-sensitive. `needle` matches a bare ident
+  //     OR the key half of a key=value (so `caps_decl_args_has(a, "subtree")`
+  //     returns 1 for both `(subtree=/home)` and `(read, subtree=/home)`).
+  //
+  //   caps_decl_args_get(args_ptr, key_ptr) -> 0 | 1
+  //     Key=value lookup. Returns 1 iff `key=value` is a token; on hit
+  //     populates the singleton slots `caps_decl_args_value_ptr` (VA of
+  //     the first byte after '=' inside the args buffer) and
+  //     `caps_decl_args_value_len` (byte length of the value until
+  //     the next ',', ')', ws, or EOF). Bare tokens (no '=') do NOT
+  //     hit `get`; they hit only `has`.
+  //
+  // Both entry points return 0 immediately if `args_ptr == 0` (the
+  // parser encodes "no args-text" as a null pointer in
+  // `req_args_texts[k]`), so a caller can dispatch through them
+  // uniformly without a defensive null check.
+  //
+  // The two entries share a single walker shape: for each token,
+  // compare byte-by-byte against the needle/key, then dispatch on
+  // the boundary byte (`,`, `)`, ws, `=`, EOF) to decide match /
+  // no-match / skip-to-next-token. Both are leaf functions and use
+  // three callee-save pushes (r12, r13, r14) for the args cursor,
+  // needle cursor save, and per-token walk cursor. No nested calls
+  // → alignment at call site is not an obligation; only push/pop
+  // parity matters.
+  //
+  // paideia-as compliance: byte reads via `xor rax, rax; mov_b rax, [ptr]`;
+  // every `cmp reg, imm` uses tiny immediates (single-byte ASCII); no
+  // `test` mnemonic; r11 reserved as .bss LEA scratch for
+  // singleton stores.
+  // ============================================================================
+
+  // Value-lookup singleton (populated on caps_decl_args_get success).
+  // Interior pointer into the args-text buffer; length excludes the
+  // terminator. `caps_decl_args_get` MUST NOT NUL-terminate the value
+  // in place — a subsequent get for a different key would then walk
+  // past the injected NUL and read stale bytes. Consumers copy the
+  // value into their own buffer using the (ptr, len) pair.
+  pub let mut caps_decl_args_value_ptr : u64 = uninit @align(8)
+  pub let mut caps_decl_args_value_len : u64 = uninit @align(8)
+
+  // ============================================================================
+  // caps_decl_args_has(args_ptr, needle_ptr) -> u64
+  //
+  // Signature: caps_decl_args_has : (u64, u64) -> u64 !{mem} @{}
+  // RDI (input): args_ptr   — VA of the '(' byte from
+  //                            CapsDecl::req_args_texts[k], or 0 if
+  //                            the item had no args-text.
+  // RSI (input): needle_ptr — VA of a NUL-terminated ASCII token to
+  //                            search for.
+  // RAX (output): 1 if `needle` appears as a bare token or as the
+  //                key half of a key=value inside the parentheses,
+  //                0 otherwise. Also 0 if args_ptr == 0.
+  //
+  // Register plan (leaf, no nested calls):
+  //   r12 = args cursor (advances through the args-text)  [callee-save]
+  //   r13 = needle base (reloaded into r14 at each new token) [callee-save]
+  //   r14 = per-token needle walk cursor                  [callee-save]
+  //   rax = args byte load
+  //   rcx = needle byte load
+  //   r11 = unused (no .bss stores in this entry)
+  //
+  // rsp alignment: 3 callee-save pushes; no nested calls, so alignment
+  // at call sites is not a concern. Push/pop parity is preserved on
+  // every exit.
+  // ============================================================================
+  pub let caps_decl_args_has : (u64, u64) -> u64 !{mem} @{} =
+    fn (args_ptr: u64) (needle_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-cap.M3-001 caps_decl_args_has. Walks the args-text at args_ptr looking for a comma-separated token matching needle. If args_ptr == 0 (no args-text on the caps.decl item) returns 0 immediately without touching callee-save regs. Otherwise skips the '(' at offset 0, then for each token: skips leading whitespace, walks needle-vs-args byte-by-byte using #1248-safe reads, and on needle-end verifies the args byte is a token boundary (',', ')', ws, '=', or NUL). Match on boundary returns 1; mismatch or non-boundary skips to the next ',' and retries. r12 holds args cursor across the outer loop; r13 preserves needle base for reloads at each new token; r14 is the per-token needle walk cursor. Three callee-save pushes with matched pops on all three exit paths (has=yes, has=no with pop, has=no fast without pop). paideia-as conformance: every cmp reg,imm uses single-byte ASCII imms; #1248-safe byte reads; r11 unused (no .bss touch); no `test` mnemonic. Leaf function; no nested calls.",
+      block: {
+        // Fast path: no args-text → cannot possibly contain the needle.
+        cmp rdi, 0;
+        je _cah_no_fast;
+
+        // ---- prologue ----
+        push r12;
+        push r13;
+        push r14;
+
+        mov r12, rdi;                   // r12 = args cursor
+        add r12, 1;                     // skip '('
+        mov r13, rsi;                   // r13 = needle base
+
+      _cah_token_head:
+        // Skip leading whitespace inside this token.
+      _cah_skip_ws:
+        xor rax, rax;
+        mov_b rax, [r12];
+        cmp rax, 0x20;                  // ' '
+        je _cah_bump_ws;
+        cmp rax, 0x09;                  // '\t'
+        je _cah_bump_ws;
+        jmp _cah_compare_setup;
+
+      _cah_bump_ws:
+        add r12, 1;
+        jmp _cah_skip_ws;
+
+      _cah_compare_setup:
+        // Start byte-by-byte compare. r14 = needle walk cursor.
+        mov r14, r13;
+
+      _cah_compare:
+        xor rax, rax;
+        mov_b rax, [r12];               // args byte
+        xor rcx, rcx;
+        mov_b rcx, [r14];               // needle byte
+        cmp rcx, 0;
+        je _cah_needle_end;             // needle exhausted; check boundary
+        cmp rax, rcx;
+        jne _cah_skip_token;
+        add r12, 1;
+        add r14, 1;
+        jmp _cah_compare;
+
+      _cah_needle_end:
+        // Needle matched; args byte in rax must be a token boundary
+        // for a real hit. Otherwise needle is a prefix of a longer
+        // token and the compare fails.
+        cmp rax, 0x29;                  // ')'
+        je _cah_yes;
+        cmp rax, 0x2C;                  // ','
+        je _cah_yes;
+        cmp rax, 0x20;
+        je _cah_yes;
+        cmp rax, 0x09;
+        je _cah_yes;
+        cmp rax, 0x3D;                  // '='
+        je _cah_yes;
+        cmp rax, 0;                     // EOF sentinel
+        je _cah_yes;
+        // Prefix match, not a whole-token hit — skip.
+        jmp _cah_skip_token;
+
+      _cah_skip_token:
+        // Advance to the next ',' or ')' (or EOF), then either wrap
+        // to the next token or terminate.
+        xor rax, rax;
+        mov_b rax, [r12];
+        cmp rax, 0x2C;                  // ','
+        je _cah_after_comma;
+        cmp rax, 0x29;                  // ')'
+        je _cah_no_pop;
+        cmp rax, 0;                     // EOF
+        je _cah_no_pop;
+        add r12, 1;
+        jmp _cah_skip_token;
+
+      _cah_after_comma:
+        add r12, 1;                     // step past ','
+        jmp _cah_token_head;
+
+      _cah_yes:
+        mov rax, 1;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      _cah_no_pop:
+        xor rax, rax;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      _cah_no_fast:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // caps_decl_args_get(args_ptr, key_ptr) -> u64
+  //
+  // Signature: caps_decl_args_get : (u64, u64) -> u64 !{mem} @{}
+  // RDI (input): args_ptr — VA of the '(' byte (or 0 for no args).
+  // RSI (input): key_ptr  — VA of a NUL-terminated ASCII key name.
+  // RAX (output): 1 on hit, 0 on miss. On hit the singleton slots
+  //                `caps_decl_args_value_ptr` and `_len` are populated;
+  //                on miss they are UNTOUCHED (fail-fast, matching
+  //                cap_unpack_checked's discipline).
+  //
+  // Semantics: same walker as caps_decl_args_has, but the boundary
+  // dispatch on needle-end requires the args byte to be exactly '='
+  // (a bare token has no value and does not hit `get`). On '=' the
+  // walker records the value's start pointer, walks until the value
+  // terminator (',', ')', ws, EOF), records the length, then returns 1.
+  //
+  // Register plan (leaf, no nested calls):
+  //   r12 = args cursor                                   [callee-save]
+  //   r13 = key base                                      [callee-save]
+  //   r14 = per-token key walk cursor / value start ptr   [callee-save]
+  //   r15 = value length accumulator                      [callee-save]
+  //   rax = args byte load
+  //   rcx = key byte load
+  //   r11 = LEA scratch for the two singleton stores (on hit only)
+  //
+  // Four callee-save pushes, matched pops on all exits. No nested
+  // calls, so alignment at call site is not an obligation.
+  // ============================================================================
+  pub let caps_decl_args_get : (u64, u64) -> u64 !{mem} @{} =
+    fn (args_ptr: u64) (key_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-cap.M3-001 caps_decl_args_get. Walks the args-text at args_ptr looking for a `key=value` token where key matches key_ptr. If args_ptr == 0 returns 0 immediately without touching callee-save regs or the singleton. Otherwise mirrors caps_decl_args_has's walker until needle-end, at which point the args byte MUST be '=' (a bare-token match here is a miss, not a hit — bare tokens use caps_decl_args_has). On '=' the walker steps past it, records r14 = value_ptr and r15 = value_len accumulator, walks byte-by-byte until the value terminator (',', ')', ws, EOF), then stores (value_ptr, value_len) to the singleton via r11 LEA scratch and returns 1. Miss (any non-hit exit) leaves the singleton UNTOUCHED — same fail-fast discipline as cap_unpack_checked's CAP_MANIFEST_EXTRA path. Four callee-save pushes with matched pops. paideia-as conformance: byte reads via xor rax,rax; mov_b rax,[ptr]; every cmp reg,imm uses single-byte ASCII imms; r11 scratch for singleton stores; no `test` mnemonic. Leaf function; no nested calls.",
+      block: {
+        // Fast path: no args-text → miss.
+        cmp rdi, 0;
+        je _cag_no_fast;
+
+        // ---- prologue ----
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov r12, rdi;                   // r12 = args cursor
+        add r12, 1;                     // skip '('
+        mov r13, rsi;                   // r13 = key base
+
+      _cag_token_head:
+      _cag_skip_ws:
+        xor rax, rax;
+        mov_b rax, [r12];
+        cmp rax, 0x20;
+        je _cag_bump_ws;
+        cmp rax, 0x09;
+        je _cag_bump_ws;
+        jmp _cag_compare_setup;
+
+      _cag_bump_ws:
+        add r12, 1;
+        jmp _cag_skip_ws;
+
+      _cag_compare_setup:
+        mov r14, r13;                   // r14 = per-token key walk cursor
+
+      _cag_compare:
+        xor rax, rax;
+        mov_b rax, [r12];               // args byte
+        xor rcx, rcx;
+        mov_b rcx, [r14];               // key byte
+        cmp rcx, 0;
+        je _cag_key_end;
+        cmp rax, rcx;
+        jne _cag_skip_token;
+        add r12, 1;
+        add r14, 1;
+        jmp _cag_compare;
+
+      _cag_key_end:
+        // Key matched; args byte MUST be '=' for a value-lookup hit.
+        cmp rax, 0x3D;                  // '='
+        jne _cag_skip_token;
+        add r12, 1;                     // step past '='
+        mov r14, r12;                   // r14 = value_ptr
+        xor r15, r15;                   // r15 = value_len = 0
+
+      _cag_walk_value:
+        xor rax, rax;
+        mov_b rax, [r12];
+        cmp rax, 0x2C;                  // ','
+        je _cag_value_end;
+        cmp rax, 0x29;                  // ')'
+        je _cag_value_end;
+        cmp rax, 0x20;                  // ' '
+        je _cag_value_end;
+        cmp rax, 0x09;                  // '\t'
+        je _cag_value_end;
+        cmp rax, 0;                     // EOF
+        je _cag_value_end;
+        add r12, 1;
+        add r15, 1;
+        jmp _cag_walk_value;
+
+      _cag_value_end:
+        // Populate singleton (value_ptr in r14, value_len in r15).
+        lea r11, [rip + caps_decl_args_value_ptr];
+        mov [r11], r14;
+        lea r11, [rip + caps_decl_args_value_len];
+        mov [r11], r15;
+
+        mov rax, 1;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      _cag_skip_token:
+        xor rax, rax;
+        mov_b rax, [r12];
+        cmp rax, 0x2C;
+        je _cag_after_comma;
+        cmp rax, 0x29;
+        je _cag_no_pop;
+        cmp rax, 0;
+        je _cag_no_pop;
+        add r12, 1;
+        jmp _cag_skip_token;
+
+      _cag_after_comma:
+        add r12, 1;
+        jmp _cag_token_head;
+
+      _cag_no_pop:
+        xor rax, rax;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      _cag_no_fast:
+        xor rax, rax;
+        ret
+      }
+    }
 }

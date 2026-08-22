@@ -27,7 +27,7 @@
 // tools arrive at R51+ we can add a `kind_names_register` extension
 // point without breaking the current API.
 //
-// Rows (13 entries, R49 scope):
+// Rows (15 entries, R49 scope after M3-001):
 //   1  KIND_PROCESS                     (base slot, paideia-os kind.pdx)
 //   2  KIND_THREAD                      (base slot)
 //   3  KIND_PAGE_TABLE                  (base slot)
@@ -41,15 +41,15 @@
 //   0x191 KIND_ELEVATE_CHANNEL          (R48b substrate-prep #1626)
 //   0x195 KIND_PDXFS_FILE               (R48b substrate-prep #1623)
 //   0x196 KIND_PDXFS_TXN                (R48b substrate-prep #1624)
+//   0x197 KIND_TTY                      (R30-PREP #1631, derived over KIND_IPC_ENDPOINT)
 //
-// Explicitly NOT in this table:
-//   KIND_TTY  — the plan doc calls out that its ordinal is "existing,
-//     base kind slot in the pre-R48 catalogue" but paideia-os HEAD has
-//     no `KIND_TTY` symbol. When softarch Round 2 confirms the ordinal
-//     (as promised in design/tooling/r49-r50-plan.md §4.4 lead), this
-//     table gains a row; until then a tool declaring KIND_TTY in
-//     caps.decl fails at cap_manifest_verify with CAP_KIND_UNKNOWN
-//     rather than silently succeeding against an assumed ordinal.
+// KIND_TTY (0x197) landed in paideia-os at R30-PREP (#1631, commit
+// cf496fb) as a derived kind over KIND_IPC_ENDPOINT. M3-001 adds the
+// mirror row so `shell`, `doc`, `ls`, and `cat` — all of which declare
+// KIND_TTY in caps.decl — pass cap_manifest_verify's Pass 1 rather
+// than failing with CAP_KIND_UNKNOWN. The row is Row 15 in the linear
+// scan; ordering matches the ordinal (0x197 = 407 = post-KIND_USER
+// derived-kind band) so a reader can locate it by its numeric slot.
 //
 // paideia-as compliance
 // ---------------------
@@ -101,6 +101,7 @@ module KindNames = structure {
   pub let _kn_str_elevate_channel : [u8; 21] = "KIND_ELEVATE_CHANNEL\0"
   pub let _kn_str_pdxfs_file      : [u8; 16] = "KIND_PDXFS_FILE\0"
   pub let _kn_str_pdxfs_txn       : [u8; 15] = "KIND_PDXFS_TXN\0"
+  pub let _kn_str_tty             : [u8;  9] = "KIND_TTY\0"
 
   // ============================================================================
   // _cap_cstr_eq(a, b) -> rc
@@ -185,7 +186,7 @@ module KindNames = structure {
   pub let kind_names_resolve : (u64) -> u64 !{mem} @{} =
     fn (name_ptr: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-cap.M2-001 kind_names_resolve. Linear scan of the 14-row R49 KindNames mirror. r12 (callee-save) holds name_ptr across every _cap_cstr_eq call so we do not need a stack spill slot; each row reloads rdi from r12 before the call. One push (r12) at prologue keeps rsp % 16 == 0 at each nested-call site (entry 8; push flips to 0). Hit paths mov the ordinal into rax and fall through to the shared epilogue; the KIND_NAMES_UNKNOWN sentinel (0xFFFFFFF4, same numeric value as Cap::CAP_KIND_UNKNOWN below) is loaded via `mov rax, imm32` — the InitCap-BAD_KIND precedent for 0xFFFFFFxx return codes. paideia-as conformance: no cmp reg,imm > 0x7FFFFFFF (the only immediate compare is `cmp rax, 0` for the _cap_cstr_eq result); r11 unused (KindNames has no .bss); no `test` mnemonic. The KIND_PAGE and KIND_MEMORY names both resolve to ordinal 4 — the base-slot alias documented at kind.pdx line 85 (KIND_MEMORY = KIND_PAGE = 4).",
+      justification: "libpdx-cap.M2-001+M3-001 kind_names_resolve. Linear scan of the 15-row R49 KindNames mirror (M3-001 added KIND_TTY at row 15 now that paideia-os cf496fb (R30-PREP #1631) pinned the 0x197 ordinal — the row the M2 header explicitly deferred). r12 (callee-save) holds name_ptr across every _cap_cstr_eq call so we do not need a stack spill slot; each row reloads rdi from r12 before the call. One push (r12) at prologue keeps rsp % 16 == 0 at each nested-call site (entry 8; push flips to 0). Hit paths mov the ordinal into rax and fall through to the shared epilogue; the KIND_NAMES_UNKNOWN sentinel (0xFFFFFFF4, same numeric value as Cap::CAP_KIND_UNKNOWN below) is loaded via `mov rax, imm32` — the InitCap-BAD_KIND precedent for 0xFFFFFFxx return codes. paideia-as conformance: no cmp reg,imm > 0x7FFFFFFF (the only immediate compare is `cmp rax, 0` for the _cap_cstr_eq result); r11 unused (KindNames has no .bss); no `test` mnemonic. The KIND_PAGE and KIND_MEMORY names both resolve to ordinal 4 — the base-slot alias documented at kind.pdx line 85 (KIND_MEMORY = KIND_PAGE = 4). KIND_TTY = 0x197 loaded via `mov rax, imm32` (0x197 = 407 fits every representation).",
       block: {
         push r12;
         mov r12, rdi;
@@ -288,6 +289,13 @@ module KindNames = structure {
         cmp rax, 0;
         je _knres_hit_pdxfs_txn;
 
+        // Row 15: KIND_TTY (M3-001; paideia-os cf496fb R30-PREP #1631)
+        mov rdi, r12;
+        lea rsi, [rip + _kn_str_tty];
+        call _cap_cstr_eq;
+        cmp rax, 0;
+        je _knres_hit_tty;
+
         // No match — return the KIND_NAMES_UNKNOWN sentinel.
         mov rax, 0xFFFFFFF4;
         pop r12;
@@ -343,6 +351,10 @@ module KindNames = structure {
         ret;
       _knres_hit_pdxfs_txn:
         mov rax, 0x196;
+        pop r12;
+        ret;
+      _knres_hit_tty:
+        mov rax, 0x197;
         pop r12;
         ret
       }
