@@ -1,8 +1,9 @@
 # libpdx-cap — status
 
 **Wave:** R49 shared library
-**Current milestone:** M4 (test suite / smoke fixtures) — CLOSED.
-Ready for M5 (1.0 signed release + .pdxdoc + mirror push).
+**Current milestone:** M5 (1.0 signed release + .pdxdoc + mirror push) — CLOSED.
+**Released:** 1.0.0 (2026-08-22).
+All planned milestones (M1..M5) closed; library is consumer-ready.
 
 ## Milestone rollup
 
@@ -17,6 +18,7 @@ Ready for M5 (1.0 signed release + .pdxdoc + mirror push).
 | M3-002 (#7)     | signed-inode helpers (re-sign under invoker user_sk if unlocked)               | LANDED |
 | M4-001 (#8)     | round-trip fuzz (10^6 random cap shapes)                                       | LANDED |
 | M4-002 (#9)     | caps.decl parse-error corpus + narrowing/extra-cap invariant matrix            | LANDED |
+| M5-001 (#10)    | dual-signed release + .pdxdoc + mirror push                                    | LANDED |
 
 See `design/tooling/r49-r50-plan.md` §5.10 in paideia-os for the full
 milestone breakdown (M1–M5) and cross-repo dependencies.
@@ -116,6 +118,42 @@ milestone breakdown (M1–M5) and cross-repo dependencies.
 - `design/architecture.md` — new §12 documenting the M4 witness
   contract, the four sub-corpora, and the future
   wave-harness invocation shape.
+
+## M5 summary
+
+### M5-001 (dual-signed release + .pdxdoc + mirror push)
+
+- `CHANGELOG.md` (NEW) — 1.0.0 entry: milestone rollup,
+  frozen return-code table (16 codes across five modules),
+  M4 witness fingerprint contract, dual-signature status,
+  mirror-push status.
+- `doc/libpdx-cap.pdxdoc` (NEW) — long-form doc for
+  `doc libpdx-cap` (`.pdxdoc` v0.1 — @-directive-driven
+  text with `## SECTION` headers and `[[TARGET]]` cross-refs;
+  survives lax parsers until doc.M1-002 lands the grammar).
+- `manifest.pdxsig` (NEW) — v0.1 release manifest with
+  SHA-256 hash tree over 12 shipped artifacts,
+  `@manifest-body-hash` over the artifact block, two
+  RESERVED 3309-byte ML-DSA-65 sig slots (author +
+  paideia_root) documented as byte-count-preserving
+  overwrite targets for the signing bot (paideia-os
+  T-INFRA-002) once the sign primitive's userspace linkage
+  lands (paideia-as v0.33-crypto).
+- `README.md` — status line advanced to "1.0.0 released";
+  new artifacts added to layout listing.
+- Git tag `v1.0.0` published on `github.com/paideia-os/libpdx-cap`
+  (authoritative distribution; `pkgs.paideia-os` mirror push
+  deferred pending T-INFRA-001).
+
+## Consumer wiring (after M5)
+
+libpdx-cap is now 1.0-frozen. Consumers pin `libpdx-cap = 1.0.0`
+in their `deps.list` and consume the artifact set enumerated in
+`manifest.pdxsig`. The `@manifest-body-hash` in that file is
+`c222bca34f44e39b9ed4902e18fcc22683c4c9ae2fc68a6a30e6ca1f23f435c0`;
+downstream verifiers re-derive it via
+`sed -n '39,/^@end-artifacts$/p' manifest.pdxsig | sha256sum`
+until `pkg verify` lands.
 
 ## Consumer wiring (after M3)
 

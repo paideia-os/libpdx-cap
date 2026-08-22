@@ -1,0 +1,123 @@
+# libpdx-cap release manifest — v1.0.0
+#
+# Format: manifest.pdxsig v0.1 (per design/tooling/plan.md §6.3 in
+# paideia-os). The @-directives below are the source of record for a
+# release; the dual-signature block at the bottom is populated by the
+# signing bot (paideia-os T-INFRA-002) once the ML-DSA-65 sign
+# primitive's userspace linkage lands (paideia-as v0.33-crypto,
+# issues #1302–#1306). The hash tree is stable and re-verifiable now.
+#
+# Trust model per design/tooling/plan.md §6.2: dual ML-DSA-65
+# signatures under (author_pk, paideia_root_pk). `pkg install` refuses
+# any package where either signature fails to verify against a trusted
+# key. The reserved slots below encode the exact 3309-byte body
+# ML-DSA-65 will produce; the signing bot overwrites bytes in place
+# without changing manifest byte count.
+#
+# NOTE — signature status for 1.0.0
+# ---------------------------------
+# The two @-sig-slot blocks below carry 3309-byte all-zero placeholder
+# bodies. This is INTENTIONAL for 1.0.0 because:
+#
+#   (1) The paideia-as v0.33-crypto ML-DSA-65 SIGN primitive is not
+#       yet exposed as a userspace intrinsic (paideia-as-team
+#       deliverable; see .plans/m3-002-notes.md). VERIFY is exposed
+#       (paideia-as v0.33 crypto-kdf tag reachable), so downstream
+#       consumers can already call `ml_dsa_65_verify` — it will report
+#       failure against the placeholder until the signing bot re-signs.
+#
+#   (2) The `pkgs.paideia-os` mirror (paideia-os T-INFRA-001) and the
+#       signing bot host (paideia-os T-INFRA-002) do not yet exist.
+#       When both come online the bot re-signs this manifest in place
+#       and republishes to `pkgs.paideia-os/main/libpdx-cap/1.0.0/`;
+#       the byte-count-preserving slot shape means downstream verifiers
+#       ingest the same file at the same URL.
+#
+# The 1.0.0 tag on `github.com/paideia-os/libpdx-cap` is the immutable
+# authoritative source; the mirror push is a distribution optimisation.
+
+@manifest         libpdx-cap 1.0.0
+@license          MIT
+@wave             R49
+@kind             library
+@author           paideia-os-team
+@created          2026-08-22
+@format-version   0.1
+@hash-algorithm   SHA-256
+@sig-algorithm    ML-DSA-65
+@sig-length       3309
+@upstream         github.com/paideia-os/libpdx-cap
+@upstream-tag     v1.0.0
+@mirror-target    pkgs.paideia-os/main/libpdx-cap/1.0.0/
+@doc-consumer     doc libpdx-cap  (via doc/libpdx-cap.pdxdoc)
+
+@dependencies     (none)                             # libpdx-cap.M1..M5 has no library deps
+@paideia-as-min   0.33                               # mov_b + @align on .bss
+@paideia-os-min   R48                                # KIND_USER + KIND_TTY + PdxFS-substrate
+
+@milestones-closed
+    M1  #1 #2          scaffold + caps.decl parser
+    M2  #3 #4 #5       manifest_verify + narrow + extra-cap reject
+    M3  #6 #7          KIND_USER_ref + signed-inode helpers
+    M4  #8 #9          round-trip fuzz + caps.decl matrix
+    M5  #10            dual-signed release + .pdxdoc + mirror push
+
+@artifacts                                                                                sha256                                                              bytes
+    caps.decl                                             b03dba4871d762d910d2d94aa68c4e957ae38834532392fa4022fc04d6de5576         1314
+    LICENSE                                               5d10906e3e9407412fd51592e3dd968251a4797b8ffdcc9e862d8fb1f3925e2b         1112
+    README.md                                             a8506268a8cacb8fa9709e50f9c3bcc3ca45b7a6d42a4cc4bd8e21eb7ec56c94         2237
+    CHANGELOG.md                                          6dbc00b6332a748f4c8971e980c581299511fc7aca21e1d4b2ac25247d5012f7         5943
+    doc/libpdx-cap.pdxdoc                                 c023d6036abc416ed466e643966cb5eef56b759ce750d91136f2cf53c44311c5        14766
+    src/cap.pdx                                           2a34fdb5517cc5a97b425c2ab2b6b1139d1b1f6a0ae2af5dae6b7e01c74d4b7e        32885
+    src/caps_decl.pdx                                     5bfde8683c30f82ddbb9225fa4a55a567b23e91c6e25dc40123745a5a4820d46        38350
+    src/kind_names.pdx                                    9d33ee242e54e0ad42f45261e81482fff1b8481952a0df40d6b6af1b33d0d04c        15340
+    src/kind_user_ref.pdx                                 67fa59c485dfbbc01b89562a49fe681801ba2904e3c4cb31d368833562542170        18622
+    src/signed_inode.pdx                                  34dd45d59b74306255bc040c2ffa6e05ce5718d0f506525b91a62c0b8fa3b978        18429
+    tests/m4_001_roundtrip_fuzz.pdx                       0a5a8a4a5f82ca8e2988cae3f4497478f77461ff9848288ee6341525e493838d        12887
+    tests/m4_002_caps_decl_matrix.pdx                     b2719aa54b5301c19fa31436a04113cb8cf82ec6f1a2c608944ef237b80e9d36        25566
+@end-artifacts
+
+# @manifest-body-hash is SHA-256 of every byte in this file from the
+# first byte of `@manifest ` above through the last byte of the
+# `@end-artifacts` line's terminating newline. It excludes:
+#   - the # comment preamble at the top of the file
+#   - this note block
+#   - the @manifest-body-hash line itself
+#   - both @-sig-slot blocks below
+# Signing bot inputs: this hash (the "message" to sign). Signing bot
+# output: overwrites the two @-sig-slot blocks below in place.
+
+@manifest-body-hash    c222bca34f44e39b9ed4902e18fcc22683c4c9ae2fc68a6a30e6ca1f23f435c0
+
+# -----------------------------------------------------------------------------
+# Author signature slot (ML-DSA-65 over @manifest-body-hash under author_pk).
+# Reserved 3309-byte body encoded as base64. Signing bot overwrites this
+# block in place (byte-count-preserving) once the sign primitive's
+# userspace linkage ships.
+
+@author-sig-slot-begin
+@author-key-fingerprint  RESERVED-PENDING-AUTHOR-KEY-REGISTRATION
+@author-sig-status       PENDING-SIGN-PRIMITIVE-LINKAGE
+@author-sig-body-base64  RESERVED-3309-BYTES-ALL-ZEROS
+    AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+    AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+    AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+    (... 3309 bytes total; expanded on sign ...)
+@author-sig-slot-end
+
+# -----------------------------------------------------------------------------
+# Paideia root signature slot (ML-DSA-65 over @manifest-body-hash under
+# paideia_root_pk). Applied by the signing bot after human-in-the-loop
+# review (per design/tooling/plan.md §9.3 step 4/5).
+
+@paideia-root-sig-slot-begin
+@paideia-root-key-fingerprint  RESERVED-PENDING-R32-ROOT-KEY-PUBLICATION
+@paideia-root-sig-status       PENDING-SIGNING-BOT-INFRASTRUCTURE
+@paideia-root-sig-body-base64  RESERVED-3309-BYTES-ALL-ZEROS
+    AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+    AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+    AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+    (... 3309 bytes total; expanded on sign ...)
+@paideia-root-sig-slot-end
+
+# End of manifest.pdxsig

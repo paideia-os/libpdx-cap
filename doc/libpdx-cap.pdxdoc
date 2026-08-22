@@ -1,0 +1,318 @@
+# libpdx-cap.pdxdoc — long-form documentation for `doc libpdx-cap`
+#
+# Format: .pdxdoc v0.1 (per design/tooling/plan.md I7 §2 in
+# paideia-os; formal grammar lands with doc.M1-002). The @-directives
+# below are a superset of what doc.M1-002 is planned to consume;
+# ignored directives are informational for human readers.
+#
+# Sections are separated by lines starting with `## `. Cross-refs use
+# `[[TARGET]]`; POSIX-difference blocks use `!! POSIX: <text>`.
+
+@doc       libpdx-cap
+@version   1.0.0
+@wave      R49
+@kind      library
+@author    paideia-os-team
+@license   MIT
+@repo      github.com/paideia-os/libpdx-cap
+@summary   Capability marshalling for tool invocations.
+@modules   Cap CapsDecl KindNames KindUserRef SignedInode
+@consumers pkg shell doc ls cat cp mv rm mkdir libpdx-elevate
+
+## NAME
+
+libpdx-cap - userspace-side idiom for `sys_cap_transfer`
+(pack, unpack, rights-narrowing, manifest-verify) + the
+`caps.decl` parser every tool ships (per invariant I6 in
+[[design/tooling/plan.md §4.2]]).
+
+## SYNOPSIS
+
+libpdx-cap is a shared library. It is linked (source-level, via
+paideia-as module import) by every R49-wave tool and by
+[[libpdx-elevate]]. It is not invoked directly.
+
+    // At the CALLER (shell → tool exec)
+    Cap::cap_pack_narrowed(
+        dst, slot, kind,
+        original_rights, narrowed_rights, target_ptr) -> u64
+
+    // At the CALLEE (tool startup after seed)
+    CapsDecl::caps_decl_reset()
+    CapsDecl::caps_decl_parse(decl_src, decl_len) -> u64
+    Cap::cap_unpack_checked(wire_ptr) -> u64      // per-cap
+    Cap::cap_manifest_verify(0, caps, count) -> u64 // bulk
+
+    // Row-decode helpers (ls --long, cp/mv/rm)
+    KindUserRef::kind_user_ref_decode(wire_ptr) -> u64
+    KindUserRef::kind_user_ref_render_hex(fp0) -> u64
+    SignedInode::signed_inode_has_signature(inode_ptr) -> u64
+    SignedInode::signed_inode_can_resign() -> u64
+    SignedInode::signed_inode_mark_unsigned(dst) -> u64
+
+## DESCRIPTION
+
+`libpdx-cap` is the earliest of the five R49 shared libraries
+(see [[design/tooling/r49-r50-plan.md §3]]). It has no library
+dependencies of its own; every other R49 library and every
+R49/R50 tool depends on it.
+
+The library serves three concerns, each with its own module:
+
+  1. **On-wire cap format** (`Cap`, [[src/cap.pdx]]). A capability
+     transferred via `sys_cap_transfer` (R20b `KIND_IPC_ENDPOINT`
+     substrate) or seeded via the loader's InitCap sidecar
+     (`paideia-os/src/kernel/core/loader/init_caps.pdx`) uses a
+     single 16-byte record: `{slot:u16, kind:u16, rights:u32,
+     target_ptr:u64}`. libpdx-cap owns the pack + unpack lanes
+     and enforces bit-identical shape with the InitCap sidecar so
+     validators are shared.
+
+  2. **caps.decl manifest** (`CapsDecl`, [[src/caps_decl.pdx]]).
+     Invariant I6 requires every tool to ship a `caps.decl` file
+     naming exactly the capabilities its callee-role requires.
+     libpdx-cap parses that file at `_start`, stores the parsed
+     record in a singleton, and compares it against the caps the
+     shell actually handed over — refusing `MISSING`, `EXTRA`,
+     `WIDENING`, or `UNKNOWN` kinds loudly (see RETURN CODES).
+
+  3. **Kind-specific decode helpers** (`KindNames`,
+     [[src/kind_names.pdx]]; `KindUserRef`,
+     [[src/kind_user_ref.pdx]]; `SignedInode`,
+     [[src/signed_inode.pdx]]). `KindNames` mirrors the R49 KIND
+     vocabulary (name -> ordinal) so `caps.decl` names resolve
+     without a syscall round-trip. `KindUserRef` decodes the
+     `KIND_USER = 0x190` wire form for `ls --long`'s owner
+     column and renders a fingerprint word as 16 hex digits.
+     `SignedInode` publishes the PdxFS v1 signed-inode layout
+     (`INODE_HEAD_BYTES = 64`, `SIG_PRESENT_OFFSET = 64`,
+     `ML_DSA_65_SIG_LEN = 3309`) and a `has_signature` /
+     `can_resign` / `mark_unsigned` triad for cp/mv/rm's
+     preserve-or-degrade path.
+
+## PUBLIC SURFACE (12 ENTRY POINTS)
+
+### `Cap` module
+
+| Entry point                                 | Purpose                                             |
+|---------------------------------------------|-----------------------------------------------------|
+| `cap_reset()`                               | Zero the unpack singleton before a fresh unpack.    |
+| `cap_pack(dst, slot, kind, rights, ptr)`    | Write a 16-byte Cap record; validates slot bound.   |
+| `cap_pack_narrowed(dst, slot, kind, orig, narrow, ptr)` | Same, plus refuse widening at send site. |
+| `cap_unpack(src)`                           | Populate unpack singleton from a wire record.       |
+| `cap_unpack_checked(src)`                   | Same, plus refuse EXTRA against parsed CapsDecl.    |
+| `cap_manifest_verify(decl, caps, count)`    | Bulk two-pass check: MISSING / EXTRA / UNKNOWN.     |
+
+### `CapsDecl` module
+
+| Entry point                                 | Purpose                                             |
+|---------------------------------------------|-----------------------------------------------------|
+| `caps_decl_reset()`                         | Clear the singleton before a fresh parse.           |
+| `caps_decl_parse(src, len)`                 | Walk the caps.decl text; populate the singleton.    |
+| `caps_decl_args_has(args, needle)`          | Bare-token membership in a `(...)` rights-args.     |
+| `caps_decl_args_get(args, key)`             | key=value lookup; populates value_ptr + value_len.  |
+
+### `KindNames` module
+
+| Entry point                    | Purpose                                       |
+|--------------------------------|-----------------------------------------------|
+| `kind_names_resolve(name_ptr)` | Resolve a NUL-terminated KIND_* name to ord.  |
+
+### `KindUserRef` module
+
+| Entry point                                    | Purpose                                       |
+|------------------------------------------------|-----------------------------------------------|
+| `kind_user_ref_reset()`                        | Clear the KIND_USER singleton.                |
+| `kind_user_ref_decode(wire_ptr)`               | Populate row_id, slot, rights, raw_target.    |
+| `kind_user_ref_render_hex(user_key)`           | Render fp0 as 16 lowercase hex digits + NUL.  |
+
+### `SignedInode` module
+
+| Entry point                                    | Purpose                                       |
+|------------------------------------------------|-----------------------------------------------|
+| `signed_inode_key_state_reset()`               | Clear key-state to 0 (locked).                |
+| `signed_inode_key_state_set(state)`            | Publish the unlock state.                     |
+| `signed_inode_has_signature(inode_ptr)`        | Byte-flag query at `[inode_ptr + 64]`.        |
+| `signed_inode_can_resign()`                    | Pure function of key-state.                   |
+| `signed_inode_mark_unsigned(dst_inode_ptr)`    | Degrade path: write 0 to sig_present.         |
+
+## CONSUMER FLOW
+
+Every R49/R50 tool wires libpdx-cap at exec as follows:
+
+    // 1. Parse own caps.decl at startup (once per process).
+    CapsDecl::caps_decl_reset()
+    let err = CapsDecl::caps_decl_parse(decl_src, decl_len)
+    if err != CapsDecl::CAPS_DECL_OK { exit 3 }   // I6 misconfigured
+
+    // 2. On each received cap, refuse EXTRA at receive site.
+    let rc = Cap::cap_unpack_checked(wire_ptr)
+    if rc != Cap::CAP_OK { exit 4 }               // I6 capability refused
+
+    // 3. At exec of a CHILD, refuse WIDENING at send site.
+    let rc = Cap::cap_pack_narrowed(
+        slot_wire_addr, slot, kind,
+        my_original_rights, narrowed_rights_for_child, target_ptr)
+    if rc != Cap::CAP_OK { exit 5 }               // widening or bad slot
+
+    // 4. After all caps loaded, bulk-verify MISSING.
+    let rc = Cap::cap_manifest_verify(0, received_caps, received_count)
+    if rc != Cap::CAP_OK { exit 4 }               // I6 capability refused
+
+`ls --long` additionally uses `KindUserRef::kind_user_ref_decode` +
+`kind_user_ref_render_hex` for the owner column; `cp` / `mv` / `rm`
+use `SignedInode::signed_inode_has_signature` +
+`signed_inode_can_resign` + `signed_inode_mark_unsigned` for the
+signed-inode preserve-or-degrade path documented in
+[[design/tooling/r49-r50-plan.md §5.6]].
+
+## RETURN CODES
+
+libpdx-cap reserves the range `0xFFFFFFEF..0xFFFFFFFE` for failure
+codes; the sidecar validator's `INIT_CAPS_BAD_*` family extends
+downward from `0xFFFFFFFF` and the two families do not collide.
+Future extensions grow libpdx-cap's range downward from
+`0xFFFFFFEF`.
+
+| Code         | Symbol                            | Module      |
+|--------------|-----------------------------------|-------------|
+| `0`          | `CAP_OK` / `CAPS_DECL_OK` / etc.  | all         |
+| `0xFFFFFFFE` | `CAP_BAD_SLOT`                    | Cap         |
+| `0xFFFFFFFD` | `CAP_BAD_KIND`                    | Cap         |
+| `0xFFFFFFFC` | `CAP_MANIFEST_MISSING`            | Cap         |
+| `0xFFFFFFFB` | `CAP_MANIFEST_EXTRA`              | Cap         |
+| `0xFFFFFFFA` | `CAPS_DECL_MALFORMED_HEADER`      | CapsDecl    |
+| `0xFFFFFFF9` | `CAPS_DECL_MALFORMED_ITEM`        | CapsDecl    |
+| `0xFFFFFFF8` | `CAPS_DECL_ITEM_OUT_OF_SECTION`   | CapsDecl    |
+| `0xFFFFFFF7` | `CAPS_DECL_REQ_OVERFLOW`          | CapsDecl    |
+| `0xFFFFFFF6` | `CAPS_DECL_SCHEMA_OVERFLOW`       | CapsDecl    |
+| `0xFFFFFFF5` | `CAP_RIGHTS_WIDENING`             | Cap         |
+| `0xFFFFFFF4` | `CAP_KIND_UNKNOWN` / `KIND_NAMES_UNKNOWN` | both  |
+| `0xFFFFFFF3` | `USER_REF_WRONG_KIND`             | KindUserRef |
+| `0xFFFFFFF2` | `USER_REF_BAD_ROW`                | KindUserRef |
+| `0xFFFFFFF1` | `SIGNED_INODE_SIG_ABSENT`         | SignedInode |
+| `0xFFFFFFF0` | `SIGNED_INODE_KEY_LOCKED`         | SignedInode |
+| `0xFFFFFFEF` | `SIGNED_INODE_BAD_INODE`          | SignedInode |
+
+## KIND VOCABULARY (M3-001 mirror)
+
+15 kinds are named by `KindNames`; a caps.decl naming an
+unlisted kind raises `CAP_KIND_UNKNOWN` at `cap_manifest_verify`.
+
+| Ord    | Name                    |
+|-------:|-------------------------|
+| 1      | KIND_PROCESS            |
+| 2      | KIND_THREAD             |
+| 3      | KIND_PAGE_TABLE         |
+| 4      | KIND_PAGE / KIND_MEMORY |
+| 5      | KIND_IPC_ENDPOINT       |
+| 6      | KIND_IPC_PORT           |
+| 8      | KIND_TIMER              |
+| 12     | KIND_NOTIFICATION       |
+| 13     | KIND_REPLY              |
+| 0x190  | KIND_USER               |
+| 0x191  | KIND_ELEVATE_CHANNEL    |
+| 0x195  | KIND_PDXFS_FILE         |
+| 0x196  | KIND_PDXFS_TXN          |
+| 0x197  | KIND_TTY                |
+
+Adding a new kind to the R49 mirror requires a
+`kind_names_resolve` row + a new `KindNames` module-level
+constant. See [[src/kind_names.pdx]].
+
+## POSIX DIFFERENCE
+
+!! POSIX: There is no POSIX ancestor.
+
+POSIX file access is mediated by uid/gid + permission bits (a
+coarse cap surface with no notion of send-side narrowing, no
+receive-side refusal, and no signed manifest). libpdx-cap is
+the userspace idiom for the capability model documented in
+`design/user/model.md` §2 and `design/tooling/plan.md` I6 —
+a fine-grained, per-invocation cap set that the callee can
+refuse before running its first instruction, mediated by a
+signed `caps.decl` manifest that a reviewer can inspect
+statically.
+
+## TEST CONTRACT
+
+libpdx-cap ships two consumer-callable witness functions under
+`tests/`; both return 0 on pass and a 1-based diagnostic index
+on the first failure. Both are seed-deterministic /
+fixture-idempotent and re-runnable inside one process.
+
+- `M4RoundtripFuzz::m4_001_roundtrip_fuzz`
+  ([[tests/m4_001_roundtrip_fuzz.pdx]]) — 10^6-iteration LCG
+  round-trip witness proving `cap_pack` and `cap_unpack` are
+  bit-exact inverses on every wire lane. Diagnostic slots
+  `_m4rf_fail_iter` + `_m4rf_fail_field` (six lane-id values).
+
+- `M4CapsDeclMatrix::m4_002_caps_decl_matrix`
+  ([[tests/m4_002_caps_decl_matrix.pdx]]) — 22-stage matrix
+  covering the parse-error corpus (S1..S8), narrowing invariant
+  (S9..S12), extra-cap rejection at both surfaces (S13..S17),
+  and signed-inode helpers (S18..S22). Diagnostic slot
+  `_m4mx_stage`.
+
+The wave-level harness that invokes both witnesses is delivered
+by the first R49-wave tool that links libpdx-cap; until then
+consumers `call` the witnesses from their own `_start` and
+assert `rax == 0`.
+
+## SEE ALSO
+
+- [[caps.decl]] — libpdx-cap's own caps.decl (`(none)`; the
+  library holds no caps of its own).
+- [[design/architecture.md]] — internal spec (wire format,
+  storage model, KindNames rationale, SignedInode layout).
+- [[design/tooling/plan.md §4.2]] — invariant I6 (capability
+  manifest per tool).
+- [[design/tooling/plan.md §6]] — dual-signature package model
+  (author + paideia_root).
+- [[design/tooling/r49-r50-plan.md §3.1]] — the R49 shared-
+  library slot libpdx-cap fills.
+- [[design/tooling/r49-r50-plan.md §5.10]] — per-milestone
+  breakdown (M1..M5) and cross-repo dependencies.
+
+## CROSS-REPO DEPENDENCIES
+
+- [[paideia-os]] R20b `KIND_IPC_ENDPOINT` (base of
+  `sys_cap_transfer`) and R48.M1 `KIND_USER = 0x190`.
+- [[paideia-os]] R30-PREP #1631 `KIND_TTY = 0x197` (cf496fb).
+- [[paideia-os]] R48b substrate-prep: `KIND_ELEVATE_CHANNEL`,
+  `KIND_PDXFS_FILE`, `KIND_PDXFS_TXN`.
+- [[paideia-as]] >= v0.33 for `mov_b` narrow-load + `@align`
+  attributes on `.bss` slots.
+- [[paideia-as]] v0.33-crypto (deferred) for the ML-DSA-65
+  sign primitive; libpdx-cap's `SignedInode` publishes the
+  layout constants today but wraps no sign call until the
+  intrinsic's userspace linkage lands.
+
+## EXAMPLES
+
+    // Example 1 - Refuse a widening cap-forward at exec.
+    // shell holds KIND_PDXFS_FILE with RIGHTS_READ; tries to
+    // forward RIGHTS_READ|RIGHTS_WRITE to a child. cap_pack_narrowed
+    // refuses at the send site with CAP_RIGHTS_WIDENING; the child
+    // never receives the widened cap.
+    let rc = Cap::cap_pack_narrowed(
+        &child_caps[0], 3, KIND_PDXFS_FILE,
+        RIGHTS_READ, RIGHTS_READ | RIGHTS_WRITE, dir_endpoint)
+    // rc == CAP_RIGHTS_WIDENING (0xFFFFFFF5)
+
+    // Example 2 - Callee refuses an EXTRA cap.
+    // ls's caps.decl names KIND_PDXFS_FILE + KIND_TTY.
+    // Shell hands KIND_PDXFS_FILE + KIND_TTY + KIND_USER;
+    // cap_unpack_checked on the third cap fails EXTRA.
+    let rc = Cap::cap_unpack_checked(&received_caps[2])
+    // rc == CAP_MANIFEST_EXTRA (0xFFFFFFFB); unpacked_* untouched
+
+    // Example 3 - Render an owner column in `ls --long`.
+    KindUserRef::kind_user_ref_reset()
+    let rc = KindUserRef::kind_user_ref_decode(&entry_cap)
+    if rc == KindUserRef::USER_REF_OK {
+        // (Consumer's own syscall path fetches fp0 via
+        //  USER_OP_QUERY_FP0 against user_ref_slot.)
+        let len = KindUserRef::kind_user_ref_render_hex(fp0)
+        // 16 hex bytes now at KindUserRef::user_ref_hex_buf
+    }
