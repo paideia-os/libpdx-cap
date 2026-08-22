@@ -16,7 +16,7 @@ library in the R49 wave.
 libpdx-cap exposes three modules to its consumers (M2-001 adds the
 `KindNames` module below):
 
-- `Cap` (`src/cap.pdx`) — the wire-format record + four entry points
+- `Cap` (`src/cap.pdx`) — the wire-format record + five entry points
   every consumer wires at exec:
   - `cap_pack(dst, slot, kind, rights, target_ptr) -> u64` — write a
     16-byte Cap record into `dst`; returns `CAP_OK` or `CAP_BAD_SLOT`.
@@ -27,14 +27,18 @@ libpdx-cap exposes three modules to its consumers (M2-001 adds the
     tool that forwards a cap to a child) uses at exec.
   - `cap_unpack(src) -> u64` — read a 16-byte Cap record from `src`;
     populates the `unpacked_*` singleton slots and returns `CAP_OK`.
+  - `cap_unpack_checked(src) -> u64` — same as `cap_unpack`, but
+    additionally verifies the received kind is named by the currently-
+    parsed `CapsDecl`; returns `CAP_OK | CAP_MANIFEST_EXTRA`. On EXTRA
+    the `unpacked_*` slots are left untouched (fail-fast).
+    **Landed at M2-003.**
   - `cap_manifest_verify(decl_ptr, received_ptr, received_count) -> u64`
     — compare a callee's parsed caps.decl against the caps it actually
     received; returns `CAP_OK | CAP_MANIFEST_MISSING | CAP_MANIFEST_EXTRA
     | CAP_KIND_UNKNOWN`. **Body landed at M2-001** (two-pass compare;
     see §7 below). `decl_ptr` is informational in M2 (the parsed record
     lives in the singleton); it is reserved for the M4 caller-owned
-    variant. M2-003 adds the receive-site checked unpack as a separate
-    entry — see its milestone.
+    variant.
 - `CapsDecl` (`src/caps_decl.pdx`) — the parser for the `caps.decl` text
   file every tool ships at its repo root (per invariant I6). One entry
   point + a singleton record every consumer reads after parse; see §4.
@@ -44,7 +48,8 @@ libpdx-cap exposes three modules to its consumers (M2-001 adds the
   used internally by `cap_manifest_verify`. See §7 below for the
   rationale for keeping the mirror inside libpdx-cap.
 
-The consumer wires libpdx-cap into its own exec path as follows:
+The consumer wires libpdx-cap into its own exec path as follows
+(post-M2 flow):
 
 ```
 // 1. Parse own caps.decl at startup (once per process).
@@ -52,13 +57,29 @@ CapsDecl::caps_decl_reset()
 let err = CapsDecl::caps_decl_parse(decl_src, decl_len)
 if err != CapsDecl::CAPS_DECL_OK { exit 3 (I6 misconfigured) }
 
-// 2. On receiving a cap (e.g. from sys_cap_transfer or InitCap seed):
+// 2a. On receiving a cap (raw path, e.g. for InitCap seed reads
+//     where the callee has not yet parsed its caps.decl):
 Cap::cap_reset()
 Cap::cap_unpack(wire_ptr)
 // walk Cap::unpacked_kind / unpacked_rights / unpacked_target_ptr
 
-// 3. At exec of a child (shell → tool):
-let rc = Cap::cap_manifest_verify(child_decl, received_caps, received_count)
+// 2b. On receiving a cap AFTER caps.decl has been parsed (checked
+//     path, M2-003): the unpack rejects an EXTRA cap synchronously.
+let rc = Cap::cap_unpack_checked(wire_ptr)
+if rc != Cap::CAP_OK { exit 4 (I6 capability refused) }
+
+// 3. At exec of a CHILD (shell → tool): forward narrowed caps to the
+//    child's cap array. M2-002 refuses widening at the send site.
+let rc = Cap::cap_pack_narrowed(
+    slot_wire_addr, slot, kind,
+    my_original_rights, narrowed_rights_for_child,
+    target_ptr)
+if rc != Cap::CAP_OK { exit 5 (send-side widening or bad slot) }
+
+// 4. At startup of a CHILD (after its shell-populated cap array is
+//    handed over): manifest-verify the full received set against the
+//    child's own caps.decl. M2-001 body performs the two-way compare.
+let rc = Cap::cap_manifest_verify(0, received_caps, received_count)
 if rc != Cap::CAP_OK { exit 4 (I6 capability refused) }
 ```
 
@@ -313,8 +334,10 @@ bug:
 - **~~No rights-narrowing at send site.~~** ✓ Landed at M2-002 (this
   commit) as `cap_pack_narrowed`. Widen-check `(narrowed & ~original)
   == 0` refuses before touching `dst` with `CAP_RIGHTS_WIDENING`.
-- **No receive-side extra-cap rejection.** cap_unpack in M1 accepts
-  any kind. M2-003 wires the extra-cap rejection into the unpack path.
+- **~~No receive-side extra-cap rejection.~~** ✓ Landed at M2-003
+  (this commit) as `cap_unpack_checked`. Fails fast with
+  `CAP_MANIFEST_EXTRA` and leaves `unpacked_*` untouched when the
+  received kind is not named by the parsed CapsDecl.
 - **No `KIND_USER_ref` decode.** `unpacked_kind == KIND_USER` yields a
   raw `unpacked_target_ptr` that consumers cannot render as a user
   name. `ls --long` owner rendering lands at M3-001.

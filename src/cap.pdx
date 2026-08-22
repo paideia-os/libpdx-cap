@@ -371,6 +371,129 @@ module Cap = structure {
     }
 
   // ============================================================================
+  // cap_unpack_checked(src) -> rc
+  //
+  // Signature: cap_unpack_checked : (u64) -> u64 !{mem} @{}
+  // RDI (input): src — VA of a 16-byte Cap record (8-byte aligned)
+  // RAX (output): CAP_OK | CAP_MANIFEST_EXTRA
+  //   (CAP_KIND_UNKNOWN is intentionally NOT surfaced here — see the
+  //   "loud detection lives at cap_manifest_verify's Pass 1" note below.)
+  //
+  // M2-003 — receive-site guarded unpack. This entry unpacks a single
+  // Cap and then verifies its kind lane is named by the currently-
+  // parsed CapsDecl. If the received kind is not in the callee's
+  // caps.decl, the unpack is REJECTED without touching the four
+  // `unpacked_*` singleton slots — mirroring cap_pack's fail-fast
+  // discipline (bad slot leaves dst untouched; extra cap leaves
+  // unpacked_* untouched).
+  //
+  // The kind-lane check walks CapsDecl::req_kind_names[0..req_count],
+  // resolves each name via KindNames::kind_names_resolve, and matches
+  // against the extracted kind. Miss → CAP_MANIFEST_EXTRA. If the
+  // decl names a kind not in the KindNames mirror, that decl entry
+  // simply fails to match (loud detection is at
+  // cap_manifest_verify's Pass 1 below, not here).
+  //
+  // Relation to cap_manifest_verify: cap_manifest_verify runs ONCE at
+  // exec after every cap has landed; cap_unpack_checked runs on EACH
+  // cap as the tool consumes it — catching an extra cap synchronously
+  // at consume time so a tool that unpacks lazily does not have to
+  // pre-scan the whole cap array. Both use the same rejection code
+  // (CAP_MANIFEST_EXTRA) so a caller sees one vocabulary.
+  //
+  // Register plan (non-leaf; calls kind_names_resolve):
+  //   r12 = decl scan index j
+  //   r13 = extracted recv kind (survives nested calls)
+  //   r14 = src ptr save (survives nested calls)
+  //   rax = kind_names_resolve result / return code
+  //   r11 = LEA scratch for .bss addresses
+  //
+  // rsp alignment: 3 callee-save pushes (r12/r13/r14). Entry rsp % 16 == 8;
+  // after 3 pushes (-24 bytes) rsp % 16 == 0. Aligned at every nested-
+  // call site. No pad needed.
+  // ============================================================================
+  pub let cap_unpack_checked : (u64) -> u64 !{mem} @{} =
+    fn (src: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-cap.M2-003 cap_unpack_checked. Guarded receive-site unpack: extracts the kind lane from the wire record, verifies it is named by the parsed CapsDecl, and only then writes the four unpacked_* singleton slots. If the kind is not in the decl, the unpack is refused with CAP_MANIFEST_EXTRA and unpacked_* are left untouched (fail-fast; mirrors cap_pack's discipline of leaving dst untouched on bad-slot). Kind-lane extraction reuses the M1 shift-and-mask idiom from cap_unpack. Uses KindNames::kind_names_resolve to translate each decl name to an ordinal for the compare. Note: the reverse pairing — a decl name that resolves to KIND_NAMES_UNKNOWN — simply fails to match at the inner compare and does NOT surface as CAP_KIND_UNKNOWN here; that loud detection lives at cap_manifest_verify's Pass 1 (a per-consume check would fire spuriously if the tool only invokes some decl entries). paideia-as conformance: r11 is .bss LEA scratch; cmp reg,imm uses imm ≤ 0x7FFFFFFF (largest is 0xFFFF for the kind mask); no `test` mnemonic; no byte reads (all wire loads are qwords). Non-leaf: three callee-save pushes (r12/r13/r14) → rsp % 16 == 0 at every nested-call site.",
+      block: {
+        // ---- prologue ------------------------------------------------------
+        push r12;
+        push r13;
+        push r14;
+
+        mov r14, rdi;                   // r14 = src (save across nested calls)
+
+        // Extract recv kind = (src[0..7] >> 16) & 0xFFFF.
+        mov rax, [rdi + 0];
+        shr rax, 16;
+        and rax, 0xFFFF;
+        mov r13, rax;                   // r13 = recv kind
+
+        // Scan CapsDecl for a matching name.
+        xor r12, r12;                   // j = 0
+
+      _cuc_scan_head:
+        lea r11, [rip + req_count];
+        mov rax, [r11];
+        cmp r12, rax;
+        jge _cuc_extra;
+
+        lea r11, [rip + req_kind_names];
+        mov rdi, [r11 + r12*8];
+
+        call kind_names_resolve;
+
+        cmp rax, r13;
+        je _cuc_hit;
+
+        add r12, 1;
+        jmp _cuc_scan_head;
+
+      _cuc_hit:
+        // Kind is declared. Perform the four-lane unpack into the
+        // singleton .bss slots (same store shape as cap_unpack).
+        mov rax, [r14 + 0];             // qword0
+
+        mov r10, 0xFFFF;
+
+        mov r9, rax;
+        and r9, r10;
+        lea r11, [rip + unpacked_slot];
+        mov [r11], r9;
+
+        mov r9, rax;
+        shr r9, 16;
+        and r9, r10;
+        lea r11, [rip + unpacked_kind];
+        mov [r11], r9;
+
+        mov r9, rax;
+        shr r9, 32;
+        lea r11, [rip + unpacked_rights];
+        mov [r11], r9;
+
+        mov r9, [r14 + 8];
+        lea r11, [rip + unpacked_target_ptr];
+        mov [r11], r9;
+
+        xor rax, rax;                   // CAP_OK
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      _cuc_extra:
+        // Kind not declared. Leave unpacked_* untouched.
+        mov rax, 0xFFFFFFFB;            // CAP_MANIFEST_EXTRA
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ============================================================================
   // cap_manifest_verify(decl_ptr, received_ptr, received_count) -> rc
   //
   // Signature: cap_manifest_verify : (u64, u64, u64) -> u64 !{mem} @{}
