@@ -96,15 +96,22 @@ module Cap = structure {
   // skeleton never returns this.
   pub let CAP_MANIFEST_EXTRA   : u64 = 0xFFFFFFFB
 
+  // cap_pack_narrowed: the caller asked to write a narrowed cap whose
+  // requested rights are not a subset of the currently-held rights —
+  // i.e., a bit is set in `narrowed_rights` that is NOT set in
+  // `original_rights`. That is widening the cap, which the send site
+  // must refuse. Landed at M2-002.
+  //
+  // Codes 0xFFFFFFFA..0xFFFFFFF6 are reserved for the CapsDecl module
+  // (see design/architecture.md §5). Cap-module error codes extend
+  // downward from 0xFFFFFFF5.
+  pub let CAP_RIGHTS_WIDENING  : u64 = 0xFFFFFFF5
+
   // cap_manifest_verify: the caps.decl names a KIND that is not in the
   // KindNames mirror (see kind_names.pdx). Same numeric value as
   // KindNames::KIND_NAMES_UNKNOWN — the two constants live in two
   // modules because KindNames is a leaf Cap depends on and cannot
   // depend back, but they name the same failure mode. Landed at M2-001.
-  //
-  // Codes 0xFFFFFFFA..0xFFFFFFF6 are reserved for the CapsDecl module
-  // (see design/architecture.md §5). Cap-module error codes extend
-  // downward from 0xFFFFFFF5 (M2+ reservations).
   pub let CAP_KIND_UNKNOWN     : u64 = 0xFFFFFFF4
 
   // ============================================================================
@@ -208,6 +215,90 @@ module Cap = structure {
 
       cap_pack_bad_slot:
         mov rax, 0xFFFFFFFE;                // CAP_BAD_SLOT
+        ret
+      }
+    }
+
+  // ============================================================================
+  // cap_pack_narrowed(dst, slot, kind, original_rights, narrowed_rights,
+  //                   target_ptr) -> rc
+  //
+  // Signature: cap_pack_narrowed : (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{}
+  // RDI (input): dst              — VA of a 16-byte destination buffer (8-aligned)
+  // RSI (input): slot             — 0..CAP_SLOT_MAX-1; else CAP_BAD_SLOT
+  // RDX (input): kind             — KIND_* (u16; caller must have masked)
+  // RCX (input): original_rights  — rights the caller currently holds
+  // R8  (input): narrowed_rights  — rights the caller wants to write
+  // R9  (input): target_ptr       — kind-specific u64
+  // RAX (output): CAP_OK | CAP_BAD_SLOT | CAP_RIGHTS_WIDENING
+  //
+  // M2-002 — cap-narrowing send helper. `shell` (and every tool that
+  // forwards a cap to a child) uses this to pack a Cap whose rights are
+  // a strict SUBSET of the rights currently held. Any bit set in
+  // narrowed_rights that is NOT set in original_rights would widen the
+  // cap on the wire — refused with CAP_RIGHTS_WIDENING before touching
+  // the destination buffer.
+  //
+  // The widen check is `(narrowed & ~original) == 0`. When that mask
+  // is non-zero, the caller is trying to hand a child cap authority the
+  // caller does not itself possess — the invariant this milestone
+  // enforces. Slot bound reuses cap_pack's precedent; the two-qword
+  // store idiom is identical to cap_pack's after the check.
+  //
+  // Widening precedes the slot check on purpose: a broken narrowing
+  // policy is a bug in the caller's cap-forwarding logic and must
+  // surface even if the same call also passed a bad slot. (Both are
+  // fatal, but the widening return names the more consequential fault.)
+  //
+  // Register plan (leaf, all caller-save):
+  //   rax = widen-mask scratch / qword0 accumulator / return value
+  //   r10 = mask constant (0xFFFF for slot / kind lanes) OR widen mask
+  //   r11 = shifted-field scratch / large-imm mov target for CAP_BAD_SLOT
+  // ============================================================================
+  pub let cap_pack_narrowed : (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (dst: u64) (slot: u64) (kind: u64) (original_rights: u64) (narrowed_rights: u64) (target_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-cap.M2-002 cap_pack_narrowed. Cap-forwarding helper: writes a narrowed Cap only after proving the requested rights are a strict subset of the currently-held rights. The widen check `(narrowed & ~original) == 0` is computed as `mov rax, rcx; not rax; and rax, r8` — if the result is non-zero, at least one bit was set in narrowed_rights that was clear in original_rights (widening), refused with CAP_RIGHTS_WIDENING before any store to dst. Slot bound (cmp rsi, 256) reuses cap_pack's precedent and is checked AFTER the widen check so a widening attempt surfaces even on an otherwise-bad slot. Two-qword store body (qword0 = slot|kind|rights, qword1 = target_ptr) is identical to cap_pack — same register plan, same paideia-as compliance (r11 scratch, no cmp imm > 0x7FFFFFFF, no `test`). Leaf function; no push/pop parity to preserve.",
+      block: {
+        // Step 1: widen check. rax = narrowed & ~original.
+        mov rax, rcx;                   // rax = original
+        not rax;                        // rax = ~original
+        and rax, r8;                    // rax = narrowed & ~original
+        cmp rax, 0;
+        jne _cpn_widening;
+
+        // Step 2: slot bound.
+        cmp rsi, 256;                   // CAP_SLOT_MAX
+        jge _cpn_bad_slot;
+
+        // Step 3: assemble qword0 = slot | (kind << 16) | (narrowed << 32).
+        mov r10, 0xFFFF;                // slot / kind lane mask
+
+        mov rax, rsi;
+        and rax, r10;                   // rax = slot & 0xFFFF
+
+        mov r11, rdx;
+        and r11, r10;                   // r11 = kind & 0xFFFF
+        shl r11, 16;
+        or  rax, r11;                   // rax |= kind lane
+
+        mov r11, r8;                    // narrowed rights (already validated)
+        shl r11, 32;
+        or  rax, r11;                   // rax |= rights lane
+
+        // Step 4: store both qwords.
+        mov [rdi + 0], rax;
+        mov [rdi + 8], r9;              // target_ptr
+
+        xor rax, rax;                   // CAP_OK
+        ret;
+
+      _cpn_widening:
+        mov rax, 0xFFFFFFF5;            // CAP_RIGHTS_WIDENING
+        ret;
+
+      _cpn_bad_slot:
+        mov rax, 0xFFFFFFFE;            // CAP_BAD_SLOT
         ret
       }
     }

@@ -16,10 +16,15 @@ library in the R49 wave.
 libpdx-cap exposes three modules to its consumers (M2-001 adds the
 `KindNames` module below):
 
-- `Cap` (`src/cap.pdx`) — the wire-format record + three entry points
+- `Cap` (`src/cap.pdx`) — the wire-format record + four entry points
   every consumer wires at exec:
   - `cap_pack(dst, slot, kind, rights, target_ptr) -> u64` — write a
     16-byte Cap record into `dst`; returns `CAP_OK` or `CAP_BAD_SLOT`.
+  - `cap_pack_narrowed(dst, slot, kind, original_rights, narrowed_rights, target_ptr) -> u64`
+    — pack a Cap only if `narrowed_rights` is a strict subset of
+    `original_rights`; returns `CAP_OK | CAP_BAD_SLOT | CAP_RIGHTS_WIDENING`.
+    **Landed at M2-002.** This is the primitive the shell (and every
+    tool that forwards a cap to a child) uses at exec.
   - `cap_unpack(src) -> u64` — read a 16-byte Cap record from `src`;
     populates the `unpacked_*` singleton slots and returns `CAP_OK`.
   - `cap_manifest_verify(decl_ptr, received_ptr, received_count) -> u64`
@@ -28,9 +33,8 @@ libpdx-cap exposes three modules to its consumers (M2-001 adds the
     | CAP_KIND_UNKNOWN`. **Body landed at M2-001** (two-pass compare;
     see §7 below). `decl_ptr` is informational in M2 (the parsed record
     lives in the singleton); it is reserved for the M4 caller-owned
-    variant. M2-002 and M2-003 add the send-site narrowing helper and
-    the receive-site checked unpack as separate entries — see their
-    respective milestones.
+    variant. M2-003 adds the receive-site checked unpack as a separate
+    entry — see its milestone.
 - `CapsDecl` (`src/caps_decl.pdx`) — the parser for the `caps.decl` text
   file every tool ships at its repo root (per invariant I6). One entry
   point + a singleton record every consumer reads after parse; see §4.
@@ -199,6 +203,7 @@ apart by the code prefix families this document reserves:
 - `0xFFFFFFFC / 0xFFFFFFFB` — Cap manifest-verify-side (`MISSING`, `EXTRA`).
 - `0xFFFFFFFA .. 0xFFFFFFF6` — CapsDecl parser codes (see
   `CAPS_DECL_*` in `src/caps_decl.pdx`).
+- `0xFFFFFFF5` — Cap M2-002 (`CAP_RIGHTS_WIDENING`).
 - `0xFFFFFFF4` — Cap M2-001 / KindNames M2-001
   (`CAP_KIND_UNKNOWN` / `KIND_NAMES_UNKNOWN`, same numeric value in
   two modules because KindNames is a leaf Cap can call but not vice
@@ -305,9 +310,9 @@ bug:
   M2-001 wires `CAP_BAD_KIND` up alongside manifest_verify's full logic
   (the two features share the same `KIND_TRANSFERABLE_TABLE` — the
   cap/kind.pdx analog to `KIND_SEEDABLE_TABLE`).
-- **No rights-narrowing at send site.** cap_pack in M1 writes whatever
-  rights the caller passes. Narrowing (widening → reject) lands at
-  M2-002.
+- **~~No rights-narrowing at send site.~~** ✓ Landed at M2-002 (this
+  commit) as `cap_pack_narrowed`. Widen-check `(narrowed & ~original)
+  == 0` refuses before touching `dst` with `CAP_RIGHTS_WIDENING`.
 - **No receive-side extra-cap rejection.** cap_unpack in M1 accepts
   any kind. M2-003 wires the extra-cap rejection into the unpack path.
 - **No `KIND_USER_ref` decode.** `unpacked_kind == KIND_USER` yields a
