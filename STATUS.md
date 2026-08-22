@@ -1,8 +1,8 @@
 # libpdx-cap — status
 
 **Wave:** R49 shared library
-**Current milestone:** M4 (test suite / smoke fixtures) — M4-001
-LANDED. M4-002 in flight.
+**Current milestone:** M4 (test suite / smoke fixtures) — CLOSED.
+Ready for M5 (1.0 signed release + .pdxdoc + mirror push).
 
 ## Milestone rollup
 
@@ -16,7 +16,7 @@ LANDED. M4-002 in flight.
 | M3-001 (#6)     | KIND_USER_ref decode helpers for ls --long owner rendering                     | LANDED |
 | M3-002 (#7)     | signed-inode helpers (re-sign under invoker user_sk if unlocked)               | LANDED |
 | M4-001 (#8)     | round-trip fuzz (10^6 random cap shapes)                                       | LANDED |
-| M4-002 (#9)     | caps.decl parse-error corpus + narrowing/extra-cap invariant matrix            | OPEN   |
+| M4-002 (#9)     | caps.decl parse-error corpus + narrowing/extra-cap invariant matrix            | LANDED |
 
 See `design/tooling/r49-r50-plan.md` §5.10 in paideia-os for the full
 milestone breakdown (M1–M5) and cross-repo dependencies.
@@ -75,7 +75,7 @@ milestone breakdown (M1–M5) and cross-repo dependencies.
   §8 (signed-inode exclusion marked ✓ landed at M3-002), §10 (NEW —
   SignedInode layout + consumer degrade path + explicit non-goals).
 
-## M4 summary (partial — through M4-001)
+## M4 summary
 
 ### M4-001 (round-trip fuzz)
 
@@ -93,6 +93,29 @@ milestone breakdown (M1–M5) and cross-repo dependencies.
   can re-derive the offending iteration's inputs from
   `M4RF_LCG_SEED = 0xC0FFEE5EA5CAB1E7` by advancing the LCG
   `N-1` times.
+
+### M4-002 (caps.decl matrix witness)
+
+- `tests/m4_002_caps_decl_matrix.pdx` (NEW) — `M4CapsDeclMatrix`
+  module with witness `m4_002_caps_decl_matrix` (22 stages across
+  four sub-corpora: 8 parse-error / 4 narrowing / 5 extra-cap
+  rejection / 5 signed-inode). Fingerprint contract: `rax == 0`
+  on all-pass; else the 1-based stage index of the first failure.
+  Companion diagnostic slot `_m4mx_stage` mirrors the return.
+- 10 `.data` (mutable initialized) caps.decl fixtures cover the
+  full `CAPS_DECL_*` error vocabulary + the two OK shapes.
+- Sub-corpus C (extra-cap rejection) exercises both surfaces
+  that raise `CAP_MANIFEST_EXTRA` — `cap_unpack_checked` at the
+  per-cap consume site (M2-003) and `cap_manifest_verify` at the
+  post-load bulk check (M2-001) — plus the `CAP_MANIFEST_MISSING`
+  and `CAP_KIND_UNKNOWN` paths.
+- Sub-corpus D (signed-inode) exercises the M3-002 helper set
+  end-to-end: key-state locked/unlocked transitions, `has_signature`
+  + `mark_unsigned` round-trip, `BAD_INODE` fail-fast on null
+  input for both.
+- `design/architecture.md` — new §12 documenting the M4 witness
+  contract, the four sub-corpora, and the future
+  wave-harness invocation shape.
 
 ## Consumer wiring (after M3)
 

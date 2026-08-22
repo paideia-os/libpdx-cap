@@ -545,3 +545,96 @@ the shape dependency the plan doc calls out at §2.1.
 paideia-as ≥ v0.33 is required by the module encoder (needed for the
 `mov_b` narrow-load mnemonic used by `CapsDecl` and for the `@align`
 attribute on `.bss` slots).
+
+## 12. M4 test-suite / smoke fixtures
+
+M4 ships two witness functions under `tests/`, each self-contained
+and callable from any consumer that links libpdx-cap:
+
+- `M4RoundtripFuzz::m4_001_roundtrip_fuzz` (M4-001) — 10^6
+  LCG-driven `cap_pack` + `cap_unpack` iterations proving every
+  wire-lane packing (§2) is a bit-exact inverse. Deterministic
+  seed (`M4RF_LCG_SEED = 0xC0FFEE5EA5CAB1E7`) so a failure at
+  iteration `N` is reproducible.
+- `M4CapsDeclMatrix::m4_002_caps_decl_matrix` (M4-002) —
+  22-stage matrix covering:
+  - **Parse-error corpus (S1..S8):** OK inline, OK one-item,
+    MALFORMED_HEADER (x2), ITEM_OUT_OF_SECTION, MALFORMED_ITEM,
+    REQ_OVERFLOW, SCHEMA_OVERFLOW — one fixture per
+    `CAPS_DECL_*` code plus the two OK shapes.
+  - **Narrowing invariant (S9..S12):** the truth table for
+    `(narrowed & ~original) == 0`: subset OK, equal OK, superset
+    WIDENING, empty-orig any-narrow WIDENING. The last case
+    catches the edge where the caller holds NO rights and tries
+    to write a Cap with ANY rights bit set.
+  - **Extra-cap rejection (S13..S17):** both surfaces that raise
+    `CAP_MANIFEST_EXTRA` — `cap_unpack_checked` (M2-003) at the
+    per-cap consume site and `cap_manifest_verify` (M2-001) at
+    the post-load bulk check — plus `CAP_MANIFEST_MISSING` and
+    `CAP_KIND_UNKNOWN` (decl names a kind not in the KindNames
+    mirror).
+  - **Signed-inode re-sign (S18..S22):** end-to-end M3-002 helper
+    exercise — `signed_inode_key_state_reset` /
+    `_set(1)` → `signed_inode_can_resign` fork, `has_signature`
+    + `mark_unsigned` round-trip, `SIGNED_INODE_BAD_INODE`
+    fail-fast on null input for both entries.
+
+### Fingerprint contract
+
+Each witness returns `0` on all-pass; on the first failure it
+returns a 1-based diagnostic index (iteration index for M4-001;
+stage index for M4-002). Diagnostic `.bss` slots mirror the
+return so a caller can also inspect them post-return:
+
+- `_m4rf_fail_iter` + `_m4rf_fail_field` (M4-001; six lane-id
+  values distinguish which of the four wire lanes diverged or
+  which operation returned non-`CAP_OK`).
+- `_m4mx_stage` (M4-002; matches the return value; also written
+  BEFORE each stage's first assertion so an aborted stage — one
+  that faults during a nested call — still leaves the slot at
+  its stage number).
+
+### Fixture storage discipline
+
+Every caps.decl fixture is `pub let mut [u8; N] = "..."` — landing
+in `.data`, not `.rodata`. `caps_decl_parse` NUL-terminates each
+list-item identifier IN PLACE at its boundary byte; a `.rodata`
+fixture would fault. The `.data` fixtures are still idempotent
+under repeated parse because the parser's ident walker treats
+`\0` as NOT a boundary byte (only `(` `@` ` ` `\t` `\n` count), so
+re-parse walks past the NUL to the next real boundary and stores
+the same identifier pointer.
+
+### Consumer contract
+
+libpdx-cap has no test harness of its own — the wave-level
+harness is delivered by the first R49-wave tool that links
+libpdx-cap (per §5.10 of the paideia-os plan doc). Until that
+tool ships, the two witnesses are:
+
+- **Inspectable** — reviewers read the assertion sequence
+  line-by-line to confirm coverage.
+- **Callable** — any userspace consumer can `call
+  m4_001_roundtrip_fuzz` and `call m4_002_caps_decl_matrix`
+  from its `_start` and assert `rax == 0`.
+- **Re-runnable** — both witnesses can be re-invoked inside the
+  same process. M4-001 is seed-deterministic; M4-002 is
+  fixture-idempotent per the walker analysis above.
+
+### paideia-as conformance in tests/
+
+- Module names PascalCase basename (`M4RoundtripFuzz`,
+  `M4CapsDeclMatrix`).
+- No `test` mnemonic in either witness.
+- Every `cmp reg, imm` uses immediate ≤ 0x7FFFFFFF; every
+  `CAPS_DECL_*` / `CAP_*` / `SIGNED_INODE_*` sentinel is staged
+  via `mov r11, imm32; cmp rax, r11` — matching
+  `cap_manifest_verify`'s `cmp rax, CAP_KIND_UNKNOWN` idiom
+  (src/cap.pdx line 580).
+- LCG constants (multiplier, increment, seed) exceed the
+  compare-imm window and are `mov r11, imm64`-staged before
+  arithmetic use — the tsc.pdx precedent for large-imm operands.
+- SysV push/pop parity: M4-001 uses three callee-save pushes
+  (rbx, r12, r13) — odd count flips rsp % 16 == 8 → 0 at each
+  nested call. M4-002 uses one pad push (rbx, unused) — one push
+  is enough because all state lives in `.bss`.

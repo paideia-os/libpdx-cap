@@ -1,0 +1,672 @@
+// tests/m4_002_caps_decl_matrix.pdx — libpdx-cap.M4-002
+// Caps.decl parse-error corpus + narrowing/extra-cap invariant matrix
+// + signed-inode re-sign correctness witness.
+//
+// Design context
+// --------------
+// M4-002 rubric from design/tooling/r49-r50-plan.md §5.10 in
+// paideia-os:
+//
+//     "caps.decl parse-error corpus + narrowing/extra-cap invariant
+//      matrix"
+//
+// The M4 milestone summary also names "signed-inode re-sign
+// correctness" — that surface lands here alongside the two invariant
+// matrices since M3-002 shipped the SignedInode helper module that
+// M4-002 exercises. The four sub-corpora are executed as one
+// witness function so a single call proves the whole M4 gate.
+//
+// The four sub-corpora are:
+//
+//   S1..S8   parse-error corpus  — one fixture per CAPS_DECL_* code
+//                                   plus two OK shapes.
+//   S9..S12  narrowing invariant — cap_pack_narrowed accepts subset
+//                                   / equal, rejects any widening.
+//   S13..S17 extra-cap rejection — cap_unpack_checked rejects a cap
+//                                   whose kind is not named by the
+//                                   parsed CapsDecl; cap_manifest_
+//                                   verify surfaces MISSING / EXTRA /
+//                                   KIND_UNKNOWN paths.
+//   S18..S22 signed-inode helpers — key-state locked / unlocked
+//                                   transitions; has_signature +
+//                                   mark_unsigned round-trip;
+//                                   BAD_INODE fail-fast on null ptr.
+//
+// Fingerprint contract
+// --------------------
+// `m4_002_caps_decl_matrix() -> u64`
+//
+//     0 = every stage passed.
+//     N = the 1-based stage index at which the first assertion
+//         failed. The stage's meaning is documented in the
+//         corresponding "// ---- Stage N: <desc>" comment in the
+//         function body, and is also written to `_m4mx_stage` before
+//         the stage's first assertion so a caller inspecting the
+//         .bss slot after the return sees the same value.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module name PascalCase basename (`M4CapsDeclMatrix`), no
+//     directory prefix.
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses immediate ≤ 0x7FFFFFFF. Every
+//     `CAPS_DECL_*`, `CAP_*`, and `SIGNED_INODE_*` error code
+//     (all 0xFFFFFFxx sentinels) is staged via `mov r11, imm32`
+//     before the compare — same pattern cap_manifest_verify uses
+//     for its `cmp rax, CAP_KIND_UNKNOWN` (see src/cap.pdx
+//     line 580).
+//   - `r11` scratch (paideia-as-reserved) — used for large-imm
+//     staging AND for LEA of .bss slots.
+//   - Byte reads N/A on wire buffers (cap_pack / cap_unpack are
+//     qword-oriented); byte WRITE via `mov_b [ptr], reg` when
+//     preparing the signed-inode fixture (setting the
+//     `sig_present` flag at offset 64 to 1).
+//   - Callee-save discipline: one push (rbx, unused — pure
+//     alignment pad). Entry rsp % 16 == 8; one push flips to 0
+//     for every nested-call site (`caps_decl_parse`, `cap_pack`,
+//     `cap_pack_narrowed`, `cap_unpack_checked`,
+//     `cap_manifest_verify`, `caps_decl_reset`,
+//     `signed_inode_key_state_reset`, `signed_inode_key_state_set`,
+//     `signed_inode_can_resign`, `signed_inode_has_signature`,
+//     `signed_inode_mark_unsigned`). Matched pop at every exit.
+//     - The witness holds no cross-call state in a callee-save reg
+//       — the stage index lives in the `_m4mx_stage` .bss slot and
+//       is re-loaded at fail. `push rbx` is therefore pure padding;
+//       we prefer it to `sub rsp, 8` because paideia-as encodes the
+//       `push` at one byte, whereas `sub rsp, 8` is four bytes, and
+//       the callee-save save/restore is a familiar shape reviewers
+//       parse faster than a bare stack adjustment.
+
+module M4CapsDeclMatrix = structure {
+
+  // ============================================================================
+  // Fixtures — .data (mutable, initialized from string literals)
+  // ============================================================================
+  //
+  // `caps_decl_parse` NUL-terminates each list-item identifier
+  // in place at its boundary byte (see src/caps_decl.pdx §In-place
+  // null-termination). After one parse the '\n' at the end of each
+  // item line is replaced with '\0'. This is idempotent under
+  // repeated parses in the fixtures below because:
+  //
+  //   - The parser's ident walker treats '\0' as NOT a boundary,
+  //     so it walks past a NUL'd position until it reaches the
+  //     next real boundary (the next '\n' in the fixture, or EOF).
+  //     The stored `req_kind_names[k]` pointer still starts at
+  //     the identifier's first byte; a C-string consumer sees the
+  //     same ident bytes and the same trailing NUL.
+  //   - Fixtures that don't reach the item-recording arm
+  //     (`_m4mx_decl_malf_hdr1`, `_m4mx_decl_malf_hdr2`,
+  //     `_m4mx_decl_item_oos`, `_m4mx_decl_malf_item`,
+  //     `_m4mx_decl_ok1` which is all-empty) never trigger a
+  //     NUL write.
+  //   - Fixtures that overflow write NULs only into the first
+  //     16 items; the 17th triggers overflow before ident recording.
+  //
+  // The witness is therefore re-runnable in the same process.
+  // ============================================================================
+
+  // OK — both sections empty inline. No ident writes.
+  // "requires: (none)\ndeclares_output_schemas: (none)\n"
+  //  0        9      16               32              48
+  pub let mut _m4mx_decl_ok1 : [u8; 49] =
+    "requires: (none)\ndeclares_output_schemas: (none)\n"
+
+  // OK — one requires item, no args-text.
+  // "requires:\n- KIND_TTY\n"
+  //  0        9 10        20
+  pub let mut _m4mx_decl_ok2 : [u8; 21] =
+    "requires:\n- KIND_TTY\n"
+
+  // MALFORMED_HEADER — unknown top-level word (starts with 'x'
+  // which is not one of the four dispatch bytes '\n', '#', '-',
+  // 'r', 'd' in caps_classify_first).
+  pub let mut _m4mx_decl_malf_hdr1 : [u8; 7] =
+    "xyzzy:\n"
+
+  // MALFORMED_HEADER — bad tail after "requires:" (byte after ':'
+  // is 'x'; parser's caps_req_check_none dispatch accepts only
+  // '\n', ' ', or '(').
+  pub let mut _m4mx_decl_malf_hdr2 : [u8; 11] =
+    "requires:x\n"
+
+  // ITEM_OUT_OF_SECTION — a list item in TOP state.
+  pub let mut _m4mx_decl_item_oos : [u8; 11] =
+    "- KIND_TTY\n"
+
+  // MALFORMED_ITEM — dash then immediate '\n' (empty ident).
+  pub let mut _m4mx_decl_malf_item : [u8; 12] =
+    "requires:\n-\n"
+
+  // REQ_OVERFLOW — 17 requires items (CAPS_DECL_MAX_REQ == 16).
+  // Header 10 bytes; each item "- KX\n" = 5 bytes; 17 items = 85;
+  // total = 95.
+  pub let mut _m4mx_decl_req_over : [u8; 95] =
+    "requires:\n- K1\n- K2\n- K3\n- K4\n- K5\n- K6\n- K7\n- K8\n- K9\n- KA\n- KB\n- KC\n- KD\n- KE\n- KF\n- KG\n- KH\n"
+
+  // SCHEMA_OVERFLOW — 17 schema items (CAPS_DECL_MAX_SCHEMAS == 16).
+  // Header 25 bytes; 17 items = 85; total = 110.
+  pub let mut _m4mx_decl_sch_over : [u8; 110] =
+    "declares_output_schemas:\n- S1\n- S2\n- S3\n- S4\n- S5\n- S6\n- S7\n- S8\n- S9\n- SA\n- SB\n- SC\n- SD\n- SE\n- SF\n- SG\n- SH\n"
+
+  // Decl with two required kinds (KIND_TTY + KIND_USER) — used by
+  // the MISSING test at Stage 15.
+  // "requires:\n- KIND_TTY\n- KIND_USER\n" = 10 + 11 + 12 = 33.
+  pub let mut _m4mx_decl_tty_user : [u8; 33] =
+    "requires:\n- KIND_TTY\n- KIND_USER\n"
+
+  // Decl naming a kind not in the KindNames mirror — used by the
+  // KIND_UNKNOWN test at Stage 17.
+  // "requires:\n- KIND_NOSUCH\n" = 10 + 14 = 24.
+  pub let mut _m4mx_decl_unknown : [u8; 24] =
+    "requires:\n- KIND_NOSUCH\n"
+
+  // ============================================================================
+  // Scratch buffers (.bss)
+  // ============================================================================
+
+  // Two-Cap wire array (32 bytes @ 8-byte alignment) — enough for
+  // both the single-cap unpack tests and the two-cap manifest tests.
+  pub let mut _m4mx_cap_buf   : [u8; 32] = uninit @align(8)
+
+  // 65-byte inode buffer (INODE_HEAD_BYTES + 1 sig_present byte).
+  // Signed-inode tests write the sig_present flag at offset 64.
+  pub let mut _m4mx_inode_buf : [u8; 65] = uninit @align(8)
+
+  // Current stage number — mirror of the return value. Written at
+  // the top of every stage; on failure the caller can read it to
+  // confirm which stage exited.
+  pub let mut _m4mx_stage : u64 = uninit @align(8)
+
+  // ============================================================================
+  // m4_002_caps_decl_matrix() -> u64
+  //
+  // Signature: () -> u64 !{mem} @{}
+  // RAX (output): 0 on all-pass; else the 1-based stage index of
+  //               the first failure.
+  //
+  // Non-leaf: calls into `caps_decl_reset`, `caps_decl_parse`,
+  // `cap_pack`, `cap_pack_narrowed`, `cap_unpack_checked`,
+  // `cap_manifest_verify`, `signed_inode_key_state_reset`,
+  // `signed_inode_key_state_set`, `signed_inode_can_resign`,
+  // `signed_inode_has_signature`, `signed_inode_mark_unsigned`.
+  //
+  // One callee-save push (rbx, unused) preserves rsp % 16 == 0
+  // at every nested call site (entry 8; one push flips to 0).
+  // ============================================================================
+  pub let m4_002_caps_decl_matrix : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-cap.M4-002 caps.decl matrix witness. Runs 22 stages covering (a) the 8-entry parse-error corpus for CapsDecl (OK inline, OK one-item, MALFORMED_HEADER x2, ITEM_OUT_OF_SECTION, MALFORMED_ITEM, REQ_OVERFLOW, SCHEMA_OVERFLOW), (b) the 4-case narrowing invariant matrix for cap_pack_narrowed (subset OK, equal OK, superset WIDENING, empty-orig any-narrow WIDENING), (c) the 5-case extra-cap rejection matrix for cap_unpack_checked + cap_manifest_verify (EXTRA on unpack, OK on unpack, MISSING on verify, EXTRA on verify, KIND_UNKNOWN on verify), and (d) the 5-case signed-inode helper suite (KEY_LOCKED after reset, OK after set(1), BAD_INODE on null has_signature, has_signature + mark_unsigned round-trip, BAD_INODE on null mark_unsigned). Each stage writes the 1-based stage index to _m4mx_stage before asserting; on the first failure returns that index in rax. On all-pass returns 0. paideia-as conformance: every large-imm compare (all CAPS_DECL_*, CAP_*, SIGNED_INODE_* error codes are 0xFFFFFFxx) uses `mov r11, imm32; cmp rax, r11` staging — same idiom as cap_manifest_verify line 580; every small-imm compare (0, 1, 0xFF, 0xFFFF) is direct. No `test` mnemonic. r11 is scratch (LEA + imm staging). Byte writes (setting sig_present=1 on the fixture inode) use `mov_b [r11], reg` — mirror of caps_decl.pdx's NUL-terminate store. Non-leaf: one callee-save push (rbx, unused; pure alignment pad) → rsp % 16 == 0 at every nested-call site. All state is in .bss; no cross-call callee-save reg needed. Fixtures are .data (mutable initialized) so `caps_decl_parse`'s in-place NUL-termination lands in writable memory; fixture text is idempotent under repeated parse per the module-header analysis (walker treats '\\0' as non-boundary so a re-parse walks past the NUL to the next boundary).",
+      block: {
+        // ---- prologue (alignment pad) --------------------------------------
+        push rbx;
+
+        // ====================================================================
+        // Sub-corpus A: parse-error corpus (S1..S8)
+        // ====================================================================
+
+        // ---- Stage 1: OK1 (both sections empty inline).
+        mov rax, 1;
+        lea r11, [rip + _m4mx_stage];
+        mov [r11], rax;
+
+        call caps_decl_reset;
+
+        lea rdi, [rip + _m4mx_decl_ok1];
+        mov rsi, 49;
+        call caps_decl_parse;
+        cmp rax, 0;
+        jne _m4mx_fail;
+
+        lea r11, [rip + req_count];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne _m4mx_fail;
+
+        lea r11, [rip + schema_count];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne _m4mx_fail;
+
+        // ---- Stage 2: OK2 (one requires item, no args-text).
+        mov rax, 2;
+        lea r11, [rip + _m4mx_stage];
+        mov [r11], rax;
+
+        call caps_decl_reset;
+
+        lea rdi, [rip + _m4mx_decl_ok2];
+        mov rsi, 21;
+        call caps_decl_parse;
+        cmp rax, 0;
+        jne _m4mx_fail;
+
+        lea r11, [rip + req_count];
+        mov rax, [r11];
+        cmp rax, 1;
+        jne _m4mx_fail;
+
+        // ---- Stage 3: MALFORMED_HEADER (unknown top-level word).
+        mov rax, 3;
+        lea r11, [rip + _m4mx_stage];
+        mov [r11], rax;
+
+        call caps_decl_reset;
+
+        lea rdi, [rip + _m4mx_decl_malf_hdr1];
+        mov rsi, 7;
+        call caps_decl_parse;
+        mov r11, 0xFFFFFFF8;              // CAPS_DECL_MALFORMED_HEADER
+        cmp rax, r11;
+        jne _m4mx_fail;
+
+        // ---- Stage 4: MALFORMED_HEADER (bad tail after "requires:").
+        mov rax, 4;
+        lea r11, [rip + _m4mx_stage];
+        mov [r11], rax;
+
+        call caps_decl_reset;
+
+        lea rdi, [rip + _m4mx_decl_malf_hdr2];
+        mov rsi, 11;
+        call caps_decl_parse;
+        mov r11, 0xFFFFFFF8;              // CAPS_DECL_MALFORMED_HEADER
+        cmp rax, r11;
+        jne _m4mx_fail;
+
+        // ---- Stage 5: ITEM_OUT_OF_SECTION (dash in TOP state).
+        mov rax, 5;
+        lea r11, [rip + _m4mx_stage];
+        mov [r11], rax;
+
+        call caps_decl_reset;
+
+        lea rdi, [rip + _m4mx_decl_item_oos];
+        mov rsi, 11;
+        call caps_decl_parse;
+        mov r11, 0xFFFFFFF6;              // CAPS_DECL_ITEM_OUT_OF_SECTION
+        cmp rax, r11;
+        jne _m4mx_fail;
+
+        // ---- Stage 6: MALFORMED_ITEM (empty ident after '-').
+        mov rax, 6;
+        lea r11, [rip + _m4mx_stage];
+        mov [r11], rax;
+
+        call caps_decl_reset;
+
+        lea rdi, [rip + _m4mx_decl_malf_item];
+        mov rsi, 12;
+        call caps_decl_parse;
+        mov r11, 0xFFFFFFF7;              // CAPS_DECL_MALFORMED_ITEM
+        cmp rax, r11;
+        jne _m4mx_fail;
+
+        // ---- Stage 7: REQ_OVERFLOW (17 requires items).
+        mov rax, 7;
+        lea r11, [rip + _m4mx_stage];
+        mov [r11], rax;
+
+        call caps_decl_reset;
+
+        lea rdi, [rip + _m4mx_decl_req_over];
+        mov rsi, 95;
+        call caps_decl_parse;
+        mov r11, 0xFFFFFFFA;              // CAPS_DECL_REQ_OVERFLOW
+        cmp rax, r11;
+        jne _m4mx_fail;
+
+        // Confirm req_count sat at the max (16) before the overflow.
+        lea r11, [rip + req_count];
+        mov rax, [r11];
+        cmp rax, 16;
+        jne _m4mx_fail;
+
+        // ---- Stage 8: SCHEMA_OVERFLOW (17 schema items).
+        mov rax, 8;
+        lea r11, [rip + _m4mx_stage];
+        mov [r11], rax;
+
+        call caps_decl_reset;
+
+        lea rdi, [rip + _m4mx_decl_sch_over];
+        mov rsi, 110;
+        call caps_decl_parse;
+        mov r11, 0xFFFFFFF9;              // CAPS_DECL_SCHEMA_OVERFLOW
+        cmp rax, r11;
+        jne _m4mx_fail;
+
+        lea r11, [rip + schema_count];
+        mov rax, [r11];
+        cmp rax, 16;
+        jne _m4mx_fail;
+
+        // ====================================================================
+        // Sub-corpus B: narrowing invariant matrix (S9..S12)
+        // ====================================================================
+
+        // ---- Stage 9: subset (orig=0xF, narrowed=0x3) → CAP_OK.
+        mov rax, 9;
+        lea r11, [rip + _m4mx_stage];
+        mov [r11], rax;
+
+        lea rdi, [rip + _m4mx_cap_buf];
+        xor rsi, rsi;                     // slot = 0
+        mov rdx, 0x197;                   // kind = KIND_TTY
+        mov rcx, 0xF;                     // original_rights
+        mov r8, 3;                        // narrowed_rights (subset)
+        xor r9, r9;                       // target_ptr = 0
+        call cap_pack_narrowed;
+        cmp rax, 0;
+        jne _m4mx_fail;
+
+        // ---- Stage 10: equal (orig=0xF, narrowed=0xF) → CAP_OK.
+        mov rax, 10;
+        lea r11, [rip + _m4mx_stage];
+        mov [r11], rax;
+
+        lea rdi, [rip + _m4mx_cap_buf];
+        xor rsi, rsi;
+        mov rdx, 0x197;
+        mov rcx, 0xF;
+        mov r8, 0xF;                      // narrowed = orig (equal → subset)
+        xor r9, r9;
+        call cap_pack_narrowed;
+        cmp rax, 0;
+        jne _m4mx_fail;
+
+        // ---- Stage 11: superset (orig=0x3, narrowed=0x7) → WIDENING.
+        mov rax, 11;
+        lea r11, [rip + _m4mx_stage];
+        mov [r11], rax;
+
+        lea rdi, [rip + _m4mx_cap_buf];
+        xor rsi, rsi;
+        mov rdx, 0x197;
+        mov rcx, 3;                       // original = bits 0,1
+        mov r8, 7;                        // narrowed = bits 0,1,2 (bit 2 added)
+        xor r9, r9;
+        call cap_pack_narrowed;
+        mov r11, 0xFFFFFFF5;              // CAP_RIGHTS_WIDENING
+        cmp rax, r11;
+        jne _m4mx_fail;
+
+        // ---- Stage 12: any-narrow over empty-orig → WIDENING.
+        mov rax, 12;
+        lea r11, [rip + _m4mx_stage];
+        mov [r11], rax;
+
+        lea rdi, [rip + _m4mx_cap_buf];
+        xor rsi, rsi;
+        mov rdx, 0x197;
+        xor rcx, rcx;                     // original = 0 (no rights held)
+        mov r8, 1;                        // narrowed = bit 0
+        xor r9, r9;
+        call cap_pack_narrowed;
+        mov r11, 0xFFFFFFF5;              // CAP_RIGHTS_WIDENING
+        cmp rax, r11;
+        jne _m4mx_fail;
+
+        // ====================================================================
+        // Sub-corpus C: extra-cap rejection matrix (S13..S17)
+        // ====================================================================
+
+        // ---- Stage 13: decl {KIND_TTY}; recv KIND_USER →
+        //                cap_unpack_checked returns CAP_MANIFEST_EXTRA.
+        mov rax, 13;
+        lea r11, [rip + _m4mx_stage];
+        mov [r11], rax;
+
+        call caps_decl_reset;
+
+        lea rdi, [rip + _m4mx_decl_ok2];
+        mov rsi, 21;
+        call caps_decl_parse;
+        cmp rax, 0;
+        jne _m4mx_fail;
+
+        // Pack a KIND_USER cap.
+        lea rdi, [rip + _m4mx_cap_buf];
+        xor rsi, rsi;
+        mov rdx, 0x190;                   // KIND_USER
+        mov rcx, 1;                       // rights (arbitrary)
+        xor r8, r8;
+        call cap_pack;
+        cmp rax, 0;
+        jne _m4mx_fail;
+
+        // Receive-side gate rejects.
+        lea rdi, [rip + _m4mx_cap_buf];
+        call cap_unpack_checked;
+        mov r11, 0xFFFFFFFB;              // CAP_MANIFEST_EXTRA
+        cmp rax, r11;
+        jne _m4mx_fail;
+
+        // ---- Stage 14: same decl; recv KIND_TTY →
+        //                cap_unpack_checked returns CAP_OK; unpacked_kind
+        //                equals 0x197.
+        mov rax, 14;
+        lea r11, [rip + _m4mx_stage];
+        mov [r11], rax;
+
+        lea rdi, [rip + _m4mx_cap_buf];
+        xor rsi, rsi;
+        mov rdx, 0x197;                   // KIND_TTY
+        mov rcx, 1;
+        xor r8, r8;
+        call cap_pack;
+        cmp rax, 0;
+        jne _m4mx_fail;
+
+        lea rdi, [rip + _m4mx_cap_buf];
+        call cap_unpack_checked;
+        cmp rax, 0;
+        jne _m4mx_fail;
+
+        lea r11, [rip + unpacked_kind];
+        mov rax, [r11];
+        cmp rax, 0x197;
+        jne _m4mx_fail;
+
+        // ---- Stage 15: decl {KIND_TTY, KIND_USER}; recv only KIND_TTY →
+        //                cap_manifest_verify returns CAP_MANIFEST_MISSING.
+        mov rax, 15;
+        lea r11, [rip + _m4mx_stage];
+        mov [r11], rax;
+
+        call caps_decl_reset;
+
+        lea rdi, [rip + _m4mx_decl_tty_user];
+        mov rsi, 33;
+        call caps_decl_parse;
+        cmp rax, 0;
+        jne _m4mx_fail;
+
+        // Pack one Cap (KIND_TTY) into the array.
+        lea rdi, [rip + _m4mx_cap_buf];
+        xor rsi, rsi;
+        mov rdx, 0x197;
+        mov rcx, 1;
+        xor r8, r8;
+        call cap_pack;
+        cmp rax, 0;
+        jne _m4mx_fail;
+
+        // Verify: KIND_USER missing.
+        xor rdi, rdi;                     // decl_ptr (informational)
+        lea rsi, [rip + _m4mx_cap_buf];
+        mov rdx, 1;                       // received_count = 1
+        call cap_manifest_verify;
+        mov r11, 0xFFFFFFFC;              // CAP_MANIFEST_MISSING
+        cmp rax, r11;
+        jne _m4mx_fail;
+
+        // ---- Stage 16: decl {KIND_TTY}; recv [KIND_TTY, KIND_USER] →
+        //                cap_manifest_verify returns CAP_MANIFEST_EXTRA.
+        mov rax, 16;
+        lea r11, [rip + _m4mx_stage];
+        mov [r11], rax;
+
+        call caps_decl_reset;
+
+        lea rdi, [rip + _m4mx_decl_ok2];
+        mov rsi, 21;
+        call caps_decl_parse;
+        cmp rax, 0;
+        jne _m4mx_fail;
+
+        // Pack Cap[0] = KIND_TTY.
+        lea rdi, [rip + _m4mx_cap_buf];
+        xor rsi, rsi;
+        mov rdx, 0x197;
+        mov rcx, 1;
+        xor r8, r8;
+        call cap_pack;
+        cmp rax, 0;
+        jne _m4mx_fail;
+
+        // Pack Cap[1] = KIND_USER, at &_m4mx_cap_buf + 16.
+        lea rdi, [rip + _m4mx_cap_buf];
+        add rdi, 16;
+        xor rsi, rsi;
+        mov rdx, 0x190;                   // KIND_USER
+        mov rcx, 1;
+        xor r8, r8;
+        call cap_pack;
+        cmp rax, 0;
+        jne _m4mx_fail;
+
+        // Verify: KIND_USER extra.
+        xor rdi, rdi;
+        lea rsi, [rip + _m4mx_cap_buf];
+        mov rdx, 2;                       // received_count = 2
+        call cap_manifest_verify;
+        mov r11, 0xFFFFFFFB;              // CAP_MANIFEST_EXTRA
+        cmp rax, r11;
+        jne _m4mx_fail;
+
+        // ---- Stage 17: decl {KIND_NOSUCH}; cap_manifest_verify returns
+        //                CAP_KIND_UNKNOWN (name not in KindNames mirror).
+        mov rax, 17;
+        lea r11, [rip + _m4mx_stage];
+        mov [r11], rax;
+
+        call caps_decl_reset;
+
+        lea rdi, [rip + _m4mx_decl_unknown];
+        mov rsi, 24;
+        call caps_decl_parse;
+        cmp rax, 0;
+        jne _m4mx_fail;
+
+        // received_count = 0 — Pass 1 catches unknown at the first
+        // declared name before the receive scan runs.
+        xor rdi, rdi;
+        lea rsi, [rip + _m4mx_cap_buf];
+        xor rdx, rdx;
+        call cap_manifest_verify;
+        mov r11, 0xFFFFFFF4;              // CAP_KIND_UNKNOWN
+        cmp rax, r11;
+        jne _m4mx_fail;
+
+        // ====================================================================
+        // Sub-corpus D: signed-inode re-sign correctness (S18..S22)
+        // ====================================================================
+
+        // ---- Stage 18: reset → can_resign returns KEY_LOCKED.
+        mov rax, 18;
+        lea r11, [rip + _m4mx_stage];
+        mov [r11], rax;
+
+        call signed_inode_key_state_reset;
+        call signed_inode_can_resign;
+        mov r11, 0xFFFFFFF0;              // SIGNED_INODE_KEY_LOCKED
+        cmp rax, r11;
+        jne _m4mx_fail;
+
+        // ---- Stage 19: set(1) → can_resign returns OK.
+        mov rax, 19;
+        lea r11, [rip + _m4mx_stage];
+        mov [r11], rax;
+
+        mov rdi, 1;
+        call signed_inode_key_state_set;
+
+        call signed_inode_can_resign;
+        cmp rax, 0;
+        jne _m4mx_fail;
+
+        // ---- Stage 20: has_signature(0) → BAD_INODE.
+        mov rax, 20;
+        lea r11, [rip + _m4mx_stage];
+        mov [r11], rax;
+
+        xor rdi, rdi;
+        call signed_inode_has_signature;
+        mov r11, 0xFFFFFFEF;              // SIGNED_INODE_BAD_INODE
+        cmp rax, r11;
+        jne _m4mx_fail;
+
+        // ---- Stage 21: prepare inode with sig_present=1; has_signature=1;
+        //                mark_unsigned=OK; has_signature=0.
+        mov rax, 21;
+        lea r11, [rip + _m4mx_stage];
+        mov [r11], rax;
+
+        // Set sig_present byte at [_m4mx_inode_buf + 64] = 1.
+        lea r11, [rip + _m4mx_inode_buf];
+        add r11, 64;                      // SIG_PRESENT_OFFSET
+        mov rax, 1;
+        mov_b [r11], rax;
+
+        // Query — expect 1 (present).
+        lea rdi, [rip + _m4mx_inode_buf];
+        call signed_inode_has_signature;
+        cmp rax, 1;
+        jne _m4mx_fail;
+
+        // Mark unsigned — expect OK.
+        lea rdi, [rip + _m4mx_inode_buf];
+        call signed_inode_mark_unsigned;
+        cmp rax, 0;
+        jne _m4mx_fail;
+
+        // Re-query — expect 0 (absent).
+        lea rdi, [rip + _m4mx_inode_buf];
+        call signed_inode_has_signature;
+        cmp rax, 0;
+        jne _m4mx_fail;
+
+        // ---- Stage 22: mark_unsigned(0) → BAD_INODE.
+        mov rax, 22;
+        lea r11, [rip + _m4mx_stage];
+        mov [r11], rax;
+
+        xor rdi, rdi;
+        call signed_inode_mark_unsigned;
+        mov r11, 0xFFFFFFEF;              // SIGNED_INODE_BAD_INODE
+        cmp rax, r11;
+        jne _m4mx_fail;
+
+        // ====================================================================
+        // All stages passed.
+        // ====================================================================
+        xor rax, rax;
+        lea r11, [rip + _m4mx_stage];
+        mov [r11], rax;
+        pop rbx;
+        ret;
+
+      _m4mx_fail:
+        // Load the current stage index (last-written by the failing
+        // stage's `mov rax, N; mov [_m4mx_stage], rax` prologue) and
+        // return it in rax. _m4mx_stage remains at that value for a
+        // caller inspecting the .bss slot post-return.
+        lea r11, [rip + _m4mx_stage];
+        mov rax, [r11];
+        pop rbx;
+        ret
+      }
+    }
+}
