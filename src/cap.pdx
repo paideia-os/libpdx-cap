@@ -211,7 +211,7 @@ module Cap = structure {
         mov [rdi + 8], r8;                  // wire[8..15] = target_ptr
 
         xor rax, rax;                       // CAP_OK
-        ret
+        ret;
 
       cap_pack_bad_slot:
         mov rax, 0xFFFFFFFE;                // CAP_BAD_SLOT
