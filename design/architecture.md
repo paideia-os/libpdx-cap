@@ -13,7 +13,8 @@ library in the R49 wave.
 
 ## 1. Public surface
 
-libpdx-cap exposes three modules to its consumers (M2-001 adds the
+libpdx-cap exposes five modules to its consumers (M3-001 adds
+`KindUserRef`, M3-002 adds `SignedInode`; M2-001 added the
 `KindNames` module below):
 
 - `Cap` (`src/cap.pdx`) — the wire-format record + five entry points
@@ -43,10 +44,30 @@ libpdx-cap exposes three modules to its consumers (M2-001 adds the
   file every tool ships at its repo root (per invariant I6). One entry
   point + a singleton record every consumer reads after parse; see §4.
 - `KindNames` (`src/kind_names.pdx`) — a mirror of the paideia-os KIND
-  vocabulary (name → ordinal) covering the R49 tooling wave (14 rows).
-  `kind_names_resolve(name_ptr) -> ord` is the single public entry;
-  used internally by `cap_manifest_verify`. See §7 below for the
-  rationale for keeping the mirror inside libpdx-cap.
+  vocabulary (name → ordinal) covering the R49 tooling wave (**15 rows
+  after M3-001**; the KIND_TTY row landed once paideia-os cf496fb pinned
+  0x197 for R30-PREP #1631). `kind_names_resolve(name_ptr) -> ord` is
+  the single public entry; used internally by `cap_manifest_verify`.
+  See §7 below for the rationale for keeping the mirror inside libpdx-cap.
+- `KindUserRef` (`src/kind_user_ref.pdx`) — landed at M3-001. Decodes
+  a wire Cap into (`row_id`, `slot`, `rights`, `raw_target_ptr`) if
+  the kind lane names `KIND_USER = 0x190`; provides a companion
+  `kind_user_ref_render_hex(user_key)` that formats a fingerprint word
+  as 16 lowercase hex digits in a NUL-terminated buffer. Consumers:
+  `ls --long` (owner column), and any coreutil whose typed-record
+  schema carries a `KIND_USER_ref` field per D2 literal (§4.4 of
+  the plan doc). See §9 below.
+- `SignedInode` (`src/signed_inode.pdx`) — landed at M3-002. Publishes
+  the PdxFS v1 signed-inode layout constants
+  (`INODE_HEAD_BYTES = 64`, `SIG_PRESENT_OFFSET = 64`,
+  `SIG_BODY_OFFSET = 65`, `ML_DSA_65_SIG_LEN = 3309`), a key-state
+  singleton the consumer sets after unlocking `user_sk`, a
+  `signed_inode_has_signature(inode_ptr)` byte-flag query, a
+  `signed_inode_can_resign()` fork-decision helper, and a
+  `signed_inode_mark_unsigned(dst)` primitive for the degrade path.
+  Consumers: `cp`, `mv`, `rm` (per §5.6, §5.7, §5.8 of the plan doc).
+  The actual ML-DSA-65 sign primitive is a paideia-as v0.33-crypto
+  intrinsic and is NOT wrapped by libpdx-cap yet; see §10 below.
 
 The consumer wires libpdx-cap into its own exec path as follows
 (post-M2 flow):
@@ -230,9 +251,14 @@ apart by the code prefix families this document reserves:
   two modules because KindNames is a leaf Cap can call but not vice
   versa; each module declares its own copy of the constant with the
   matching value).
+- `0xFFFFFFF3` — KindUserRef M3-001 (`USER_REF_WRONG_KIND`).
+- `0xFFFFFFF2` — KindUserRef M3-001 (`USER_REF_BAD_ROW`).
+- `0xFFFFFFF1` — SignedInode M3-002 (`SIGNED_INODE_SIG_ABSENT`).
+- `0xFFFFFFF0` — SignedInode M3-002 (`SIGNED_INODE_KEY_LOCKED`).
+- `0xFFFFFFEF` — SignedInode M3-002 (`SIGNED_INODE_BAD_INODE`).
 
-Future codes extend downward from `0xFFFFFFF4` (M2+ reservations
-appear in the individual `.plans/m2-*-notes.md`); the sidecar
+Future codes extend downward from `0xFFFFFFEF` (M3+ reservations
+appear in the individual `.plans/m3-*-notes.md`); the sidecar
 validator extends upward from `0xFFFFFFFF` (`INIT_CAPS_BAD_COUNT`).
 The two families cannot collide before the code space is exhausted.
 
@@ -271,35 +297,40 @@ plus a `mov rax, ord; ret` epilogue). Its single public entry
 `Cap::cap_manifest_verify` (both passes) and — once M2-003 lands —
 by `Cap::cap_unpack_checked`.
 
-The 14 mirrored rows (M2 scope):
+The 15 mirrored rows (M3-001 scope; the KIND_TTY row added
+alongside `KindUserRef`):
 
-| ord    | name                    | source in paideia-os cap/kind.pdx |
-|-------:|-------------------------|-----------------------------------|
-| 1      | KIND_PROCESS            | line 60                           |
-| 2      | KIND_THREAD             | line 61                           |
-| 3      | KIND_PAGE_TABLE         | line 62                           |
-| 4      | KIND_PAGE               | line 63 (also KIND_MEMORY alias)  |
-| 4      | KIND_MEMORY             | line 85 (alias of KIND_PAGE)      |
-| 5      | KIND_IPC_ENDPOINT       | line 72 (R20b)                    |
-| 6      | KIND_IPC_PORT           | line 73                           |
-| 8      | KIND_TIMER              | line 87                           |
-| 12     | KIND_NOTIFICATION       | line 91                           |
-| 13     | KIND_REPLY              | line 92                           |
-| 0x190  | KIND_USER               | line 2498 (R48.M1 #1517)          |
-| 0x191  | KIND_ELEVATE_CHANNEL    | line 2533 (R48b substrate-prep)   |
-| 0x195  | KIND_PDXFS_FILE         | line 2566 (R48b substrate-prep)   |
-| 0x196  | KIND_PDXFS_TXN          | line 2596 (R48b substrate-prep)   |
+| ord    | name                    | source in paideia-os cap/kind.pdx / kind_tty.pdx |
+|-------:|-------------------------|--------------------------------------------------|
+| 1      | KIND_PROCESS            | line 60                                          |
+| 2      | KIND_THREAD             | line 61                                          |
+| 3      | KIND_PAGE_TABLE         | line 62                                          |
+| 4      | KIND_PAGE               | line 63 (also KIND_MEMORY alias)                 |
+| 4      | KIND_MEMORY             | line 85 (alias of KIND_PAGE)                     |
+| 5      | KIND_IPC_ENDPOINT       | line 72 (R20b)                                   |
+| 6      | KIND_IPC_PORT           | line 73                                          |
+| 8      | KIND_TIMER              | line 87                                          |
+| 12     | KIND_NOTIFICATION       | line 91                                          |
+| 13     | KIND_REPLY              | line 92                                          |
+| 0x190  | KIND_USER               | line 2498 (R48.M1 #1517)                         |
+| 0x191  | KIND_ELEVATE_CHANNEL    | line 2533 (R48b substrate-prep)                  |
+| 0x195  | KIND_PDXFS_FILE         | line 2566 (R48b substrate-prep)                  |
+| 0x196  | KIND_PDXFS_TXN          | line 2596 (R48b substrate-prep)                  |
+| 0x197  | KIND_TTY                | kind_tty.pdx line 110 (R30-PREP #1631, cf496fb)  |
 
-Explicitly NOT in this table (M2 scope):
+Explicitly NOT in this table (post-M3 scope):
 
-- **KIND_TTY.** `design/tooling/r49-r50-plan.md` §4.4 lead calls out
-  that its ordinal is "existing, base kind slot in the pre-R48
-  catalogue — softarch Round 2 confirms the ordinal from paideia-os
-  HEAD". paideia-os HEAD has no `KIND_TTY` symbol at the time of M2;
-  the row lands when softarch Round 2 pins the ordinal.
-- Every derived-kind tag above `0x196` (KIND_HW_INTERRUPT and
+- Every derived-kind tag above `0x197` (KIND_HW_INTERRUPT and
   friends). None of them appear in an R49-tool `caps.decl`; when a
   later-wave tool needs one, a row lands here.
+
+**KIND_TTY history.** M2 deferred this row because paideia-os HEAD at
+2026-08-21 had no `KIND_TTY` symbol; the M2 header explicitly noted
+that a tool declaring `KIND_TTY` would fail with `CAP_KIND_UNKNOWN`
+until softarch Round 2 pinned the ordinal. paideia-os cf496fb
+(R30-PREP #1631) landed `KIND_TTY = 0x197` as a derived kind over
+`KIND_IPC_ENDPOINT`, at which point M3-001 added the row (`shell`,
+`doc`, `ls`, and `cat` all declare `KIND_TTY` in their caps.decl).
 
 **Miss policy.** If a caps.decl names a kind not in the mirror,
 `kind_names_resolve` returns `KIND_NAMES_UNKNOWN` (`0xFFFFFFF4`), and
@@ -338,11 +369,17 @@ bug:
   (this commit) as `cap_unpack_checked`. Fails fast with
   `CAP_MANIFEST_EXTRA` and leaves `unpacked_*` untouched when the
   received kind is not named by the parsed CapsDecl.
-- **No `KIND_USER_ref` decode.** `unpacked_kind == KIND_USER` yields a
-  raw `unpacked_target_ptr` that consumers cannot render as a user
-  name. `ls --long` owner rendering lands at M3-001.
-- **No signed-inode helpers.** cp/mv/rm's re-sign-under-invoker path
-  lands at M3-002.
+- **~~No `KIND_USER_ref` decode.~~** ✓ Landed at M3-001 in
+  `src/kind_user_ref.pdx` — `kind_user_ref_decode(wire_ptr)`
+  populates `user_ref_row_id` and companions;
+  `kind_user_ref_render_hex(user_key)` produces the 16-hex-digit
+  owner-column string.
+- **~~No signed-inode helpers.~~** ✓ Landed at M3-002 in
+  `src/signed_inode.pdx` — layout constants + key-state singleton
+  + `has_signature` / `can_resign` / `mark_unsigned` helpers.
+  The ML-DSA-65 sign primitive itself remains a paideia-as
+  v0.33-crypto intrinsic and is NOT wrapped by libpdx-cap yet
+  (see §10).
 - **No round-trip fuzz.** M1 has no automated round-trip test in
   `tests/`. The 10^6-cap-shape fuzz lands at M4-001; M1 relies on the
   invariant that the pack + unpack lane definitions in §2 are
@@ -350,7 +387,148 @@ bug:
   by inspection). A single golden round-trip cap will accompany the
   first consumer (`shell` or `pkg`) that wires libpdx-cap at exec.
 
-## 8. Cross-repo dependencies
+## 9. `KindUserRef` — KIND_USER wire decode + owner-column hex render (M3-001)
+
+`KindUserRef` (`src/kind_user_ref.pdx`) is the fourth module libpdx-cap
+ships. It has two entry points:
+
+- `kind_user_ref_decode(cap_wire_ptr) -> rc` — verifies the wire
+  record is a `KIND_USER` cap (kind lane == 0x190) and populates
+  four singleton slots (`user_ref_row_id`, `user_ref_slot`,
+  `user_ref_rights`, `user_ref_raw_target`). Returns `USER_REF_OK`,
+  `USER_REF_WRONG_KIND`, or `USER_REF_BAD_ROW`. Fail-fast
+  discipline: on refusal the singleton is UNTOUCHED (matches
+  `cap_unpack_checked`'s M2-003 shape).
+- `kind_user_ref_render_hex(user_key) -> len` — renders a u64
+  fingerprint word (typically obtained by invoking the KIND_USER
+  cap with `USER_OP_QUERY_FP0` per paideia-os
+  `kind_user.pdx` line 133) as 16 lowercase hex digits + NUL into
+  `user_ref_hex_buf`. Always returns 16.
+
+**Two-step consumer flow.** `ls --long` uses the two together:
+
+```
+// Per directory entry, before rendering the row:
+KindUserRef::kind_user_ref_reset()
+let rc = KindUserRef::kind_user_ref_decode(wire_ptr)
+if rc != KindUserRef::USER_REF_OK {
+    render "?" as owner column
+    continue
+}
+// Invoke KIND_USER cap at KindUserRef::user_ref_slot with
+// USER_OP_QUERY_FP0 → fp0. (Consumer's own syscall path;
+// libpdx-cap does not issue the invoke.)
+let len = KindUserRef::kind_user_ref_render_hex(fp0)
+// Owner column now sits at KindUserRef::user_ref_hex_buf, `len` bytes.
+```
+
+**Why decode + render are split.** Decode is pure wire inspection;
+render is pure formatting. The step in the middle (invoking the cap
+to obtain the fingerprint) requires a cap handle libpdx-cap does not
+own. Keeping the boundary here lets the consumer batch fingerprint
+queries across N ls entries in a single syscall pass at a later
+milestone without changing this library.
+
+**Why `user_ref_row_id` and NOT a fingerprint decode.** paideia-os's
+KIND_USER wire encoding puts the kernel row_id in the low 16 bits of
+`target_ptr` (per `kind_user.pdx` line 950 comment
+`target_ptr = row_id`); the fingerprint itself is not on the wire.
+A libpdx-cap that pretended to "decode a fingerprint" would have to
+mirror the kernel's `_user_table` — a synchronization hazard we
+refuse. The row_id + cap-invoke round trip is the honest path.
+
+## 10. `SignedInode` — PdxFS v1 signed-inode helpers (M3-002)
+
+`SignedInode` (`src/signed_inode.pdx`) is the fifth module libpdx-cap
+ships. It publishes:
+
+- **Layout constants** matching the PdxFS v1 signed-inode wire
+  format from `design/user/model.md` §10.2:
+  - `INODE_HEAD_BYTES = 64` — the fixed head at inode offset 0.
+  - `SIG_PRESENT_OFFSET = 64` — one u8 flag (0/1).
+  - `SIG_BODY_OFFSET = 65` — start of the ML-DSA-65 signature body
+    when the flag is 1.
+  - `ML_DSA_65_SIG_LEN = 3309` — NIST FIPS-204 published parameter.
+  - `SIGNED_INODE_TOTAL_BYTES = 3374` = 64 + 1 + 3309.
+  - `UNSIGNED_INODE_TOTAL_BYTES = 65` = 64 + 1.
+- **A key-state singleton** (`signed_inode_key_state`) the consumer
+  populates at session start from the paideia-os user-sk unlock
+  query. Values: `0` = locked (fail-safe default), `1` = unlocked.
+- **Four entry points**:
+  - `signed_inode_key_state_reset()` — clear to 0.
+  - `signed_inode_key_state_set(state)` — set to whatever the caller
+    passes (validation-free; only the value `1` unlocks the resign
+    path, so garbage values fail closed).
+  - `signed_inode_has_signature(inode_ptr) -> rc` — byte-flag query
+    (`1` present, `0` absent, `SIGNED_INODE_BAD_INODE` on null).
+  - `signed_inode_can_resign() -> rc` — pure function of key-state
+    (`SIGNED_INODE_OK` if unlocked, else `SIGNED_INODE_KEY_LOCKED`).
+  - `signed_inode_mark_unsigned(dst) -> rc` — writes 0 to
+    `[dst + 64]`, for the degrade path.
+
+**Consumer flow (cp §5.6 of the plan doc):**
+
+```
+if SignedInode::signed_inode_has_signature(src_inode) == 1 {
+    if SignedInode::signed_inode_can_resign() == SignedInode::SIGNED_INODE_OK {
+        // Attempt re-sign via paideia-as v0.33-crypto intrinsic
+        // (not in libpdx-cap yet — see "what this module does NOT do"
+        // below). On success the destination carries a fresh signature
+        // under the invoker's user_sk. On failure, fall to the
+        // mark-unsigned path with a --verbose diagnostic.
+    } else {
+        // Key locked. Emit --verbose diagnostic:
+        //   "cp: source has signature; destination unsigned (user_sk locked)"
+        SignedInode::signed_inode_mark_unsigned(dst_inode)
+    }
+} else {
+    // Source unsigned. Destination inherits the unsigned status;
+    // mark_unsigned to keep the flag byte coherent (0, not stale).
+    SignedInode::signed_inode_mark_unsigned(dst_inode)
+}
+```
+
+**What this module does NOT do (M3 explicitly):**
+
+- No ML-DSA-65 sign primitive. That is a paideia-as v0.33-crypto
+  intrinsic (see plan doc §2.4 "paideia-as v0.33-crypto dependency");
+  wrapping it lands at a later libpdx-cap milestone once the
+  intrinsic's userspace linkage is published.
+- No user_sk fetch. The consumer publishes the key-state flag; the
+  material bytes never enter libpdx-cap. This keeps libpdx-cap
+  dependency-free per §5.10 (libpdx-cap.M1 has no library dependencies;
+  M3 preserves that).
+- No source-signature verify. cp's read path relies on
+  KIND_PDXFS_FILE's own signature-verify hook (R42-PREP substrate);
+  libpdx-cap sees only inodes the kernel has already validated.
+
+## §4 addendum — rights-args-text helpers (M3-001)
+
+M2 stored `req_args_texts[k]` as an opaque pointer to `(`. M3-001
+lifts the interior into two query entries that consumers use to
+compare received rights-args-refinements without duplicating the
+tokenizer:
+
+- `caps_decl_args_has(args_ptr, needle_ptr) -> 0 | 1` — bare-token
+  membership. `caps_decl_args_has(a, "read")` returns 1 for both
+  `(read)` and `(read, subtree=/home)`.
+- `caps_decl_args_get(args_ptr, key_ptr) -> 0 | 1` — key=value
+  lookup. On hit populates `caps_decl_args_value_ptr` and
+  `caps_decl_args_value_len` (value stays in place inside the source
+  buffer — the getter does NOT NUL-terminate, so multiple gets
+  against the same args-text work).
+
+Both return 0 immediately when `args_ptr == 0` (the parser's "no
+args-text" encoding), so callers can dispatch through them
+uniformly. Grammar covered:
+
+```
+args-text = '(' token ( ',' SPACES? token )* ')'
+token     = bare-ident              | key '=' value
+value     = VCHAR*                  (stops at ',', ')', ws, EOF)
+```
+
+## 11. Cross-repo dependencies
 
 Per `design/tooling/r49-r50-plan.md` §5.10 in paideia-os:
 **libpdx-cap.M1 has no library dependencies**. It is the earliest

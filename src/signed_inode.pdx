@@ -1,0 +1,360 @@
+// src/signed_inode.pdx — libpdx-cap.M3-002
+// SignedInode: layout constants + query helpers for cp/mv/rm re-sign.
+//
+// Design context
+// --------------
+// Per design/tooling/r49-r50-plan.md §5.6 (cp M2-002) and §4.6:
+//
+//   "if the source file's inode signature (PdxFS v1 signed-inode field
+//    per design/user/model.md §10.2) is present, cp calls libpdx-cap
+//    to re-sign the destination inode under the invoker's user_sk —
+//    which requires the passphrase to be currently unlocked, and
+//    gracefully degrades to unsigned copy with a --verbose diagnostic
+//    if not."
+//
+// This module supplies the PIECES cp/mv/rm need to implement that
+// path without each one re-defining the format constants or the
+// key-unlock query shape:
+//
+//   1) LAYOUT CONSTANTS. INODE_HEAD_BYTES = 64, SIG_PRESENT_OFFSET = 64
+//      (one u8 flag), SIG_BODY_OFFSET = 65, ML_DSA_65_SIG_LEN = 3309.
+//      Consumers use these to compute destination-inode buffer sizes
+//      and to point at the signature field without magic numbers.
+//
+//   2) KEY-STATE SINGLETON. A u64 flag published by the consumer at
+//      session start (from the paideia-os user-sk unlock query — the
+//      exact syscall/broker path is out-of-scope for M3, since PdxFS v1
+//      itself is R42 substrate and the crypto-unlock intrinsic is on
+//      the paideia-as v0.33-crypto tag reachability path per §5.10
+//      cross-repo deps). Once populated, `signed_inode_can_resign()`
+//      is a pure function of this flag.
+//
+//   3) SIGNATURE PRESENCE QUERY. `signed_inode_has_signature(inode_ptr)`
+//      reads the sig_present byte at [inode_ptr + 64] via the
+//      #1248-safe pattern and returns 0 or 1 (or SIGNED_INODE_BAD_INODE
+//      if inode_ptr == 0).
+//
+//   4) MARK-UNSIGNED HELPER. `signed_inode_mark_unsigned(dst)` writes
+//      a 0 byte at [dst + 64] — the primitive cp/mv use when the
+//      re-sign path is unavailable (KEY_LOCKED) and the destination
+//      must land unsigned. The destination's INODE_HEAD_BYTES came
+//      from cp's earlier copy path; the mark step just clears the
+//      sig_present flag so the destination is coherent.
+//
+// What this module DOES NOT do:
+//
+//   - It does not perform the ML-DSA-65 sign itself. That is a
+//     paideia-as v0.33-crypto intrinsic (see design/tooling/r49-r50-plan.md
+//     §2.4 "paideia-as v0.33-crypto dependency"); the intrinsic's
+//     linkage into userspace is a paideia-as-team deliverable that
+//     lands ahead of pkg.M3. When it lands, a follow-up milestone
+//     wraps it with the layout constants here to produce a full
+//     `signed_inode_resign(src, dst, user_sk_slot)` entry.
+//
+//   - It does not fetch the invoker's user_sk. The key-state flag
+//     is set by the consumer from the syscall/broker path; the
+//     material bytes never enter this library. This keeps libpdx-cap
+//     dependency-free of crypto-primitive linkage (§5.10 cross-repo
+//     deps: libpdx-cap.M1 has no library dependencies).
+//
+//   - It does not verify a source signature. cp's read path invokes
+//     the source's KIND_PDXFS_FILE handler, which — once R42-PREP
+//     lands the signed-inode verify hook — will refuse a corrupted
+//     signature at read time. libpdx-cap sees only well-formed
+//     inodes on the copy path.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module name PascalCase basename (`SignedInode`), no directory
+//     prefix.
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses immediate ≤ 0x7FFFFFFF (largest is
+//     the byte-value compare against 1 in has_signature).
+//   - r11 scratch: every `lea r11, [rip + sym]` respects the
+//     reservation; no persistent r11 across a call (there are no
+//     nested calls in this module).
+//   - Byte reads via `xor rax, rax; mov_b rax, [ptr]` per #1248.
+//   - Byte writes via `mov_b [ptr], rax` (mirror pattern from
+//     caps_decl.pdx's NUL-terminate stores).
+//   - All entries are LEAF — no callee-save touched, no push/pop
+//     parity to preserve.
+
+module SignedInode = structure {
+
+  // ============================================================================
+  // Return codes
+  //
+  // Range 0xFFFFFFF1..0xFFFFFFEE reserved for SignedInode per
+  // design/architecture.md §5. Extends downward from
+  // KindUserRef::USER_REF_BAD_ROW (0xFFFFFFF2).
+  // ============================================================================
+
+  // Success — used by can_resign, mark_unsigned, and as the value the
+  // key-state singleton takes when unlocked.
+  pub let SIGNED_INODE_OK           : u64 = 0
+
+  // has_signature: [inode_ptr + SIG_PRESENT_OFFSET] == 0.
+  // Also the sentinel a query returns when there is no signature to
+  // preserve on the destination.
+  pub let SIGNED_INODE_SIG_ABSENT   : u64 = 0xFFFFFFF1
+
+  // can_resign: signed_inode_key_state == 0 (locked). Consumer
+  // fork: emit --verbose diagnostic + call signed_inode_mark_unsigned
+  // to land an unsigned destination inode.
+  pub let SIGNED_INODE_KEY_LOCKED   : u64 = 0xFFFFFFF0
+
+  // has_signature / mark_unsigned: inode_ptr == 0. Fail-fast rather
+  // than dereference NULL — consumers must own the inode buffer
+  // before passing it to any SignedInode entry.
+  pub let SIGNED_INODE_BAD_INODE    : u64 = 0xFFFFFFEF
+
+  // ============================================================================
+  // Wire-format constants (PdxFS v1 signed-inode layout,
+  // design/user/model.md §10.2)
+  //
+  // Layout at rest:
+  //
+  //   +0     [u8; 64]  inode head       (mode | size | mtime | ... | ...)
+  //   +64    u8         sig_present     (0 = unsigned, 1 = signed)
+  //   +65    [u8; ML_DSA_65_SIG_LEN]  sig_body   (present iff sig_present == 1)
+  //
+  // Total footprint:
+  //   - UNSIGNED_INODE_TOTAL_BYTES = 65
+  //   - SIGNED_INODE_TOTAL_BYTES   = 65 + 3309 = 3374
+  //
+  // The 64-byte head is R42-substrate-shaped (PdxFS v1 has not
+  // finalized its inode layout at HEAD; the 64-byte head matches
+  // both the KindUser row layout and the natural u64 * 8 fields
+  // count PdxFS v1 is expected to publish). If R42-PREP shifts the
+  // head width, THIS module changes and every consumer picks up the
+  // new offset by rebuilding — the whole point of centralising the
+  // constants here rather than sprinkling `64` through cp/mv/rm.
+  // ============================================================================
+  pub let INODE_HEAD_BYTES           : u64 = 64
+  pub let SIG_PRESENT_OFFSET         : u64 = 64
+  pub let SIG_BODY_OFFSET            : u64 = 65
+  pub let ML_DSA_65_SIG_LEN          : u64 = 3309    // NIST FIPS-204 ML-DSA-65 sig
+  pub let SIGNED_INODE_TOTAL_BYTES   : u64 = 3374    // 64 + 1 + 3309
+  pub let UNSIGNED_INODE_TOTAL_BYTES : u64 = 65      // 64 + 1
+
+  // Sig-present flag values (u8 in the wire byte at SIG_PRESENT_OFFSET).
+  pub let SIG_FLAG_ABSENT : u64 = 0
+  pub let SIG_FLAG_PRESENT : u64 = 1
+
+  // ============================================================================
+  // Key-state singleton
+  //
+  // Populated by the consumer (cp/mv/rm) at session start from the
+  // paideia-os user-sk unlock query. Values:
+  //
+  //   0 = locked   — invoker's user_sk is not currently accessible;
+  //                  signed_inode_can_resign returns KEY_LOCKED and
+  //                  cp/mv/rm fall to the unsigned-destination path.
+  //   1 = unlocked — invoker's user_sk is in a Cap<KIND_MEMORY> that
+  //                  the crypto intrinsic can consume;
+  //                  signed_inode_can_resign returns OK.
+  //
+  // Any other value is treated the same as 0 (locked). This is a
+  // deliberate fail-safe: a consumer that forgets to call
+  // signed_inode_key_state_set(1) after an unlock produces unsigned
+  // destinations, not a false-positive "we can sign" that would
+  // later fail deep in the crypto path.
+  //
+  // The flag is a single u64 rather than a bit field because the
+  // .bss slot is 8-byte aligned anyway and the u64 form is
+  // testable with a single load + compare — no bit-extract needed.
+  // ============================================================================
+  pub let mut signed_inode_key_state : u64 = uninit @align(8)
+
+  // ============================================================================
+  // signed_inode_key_state_reset()
+  //
+  // Signature: signed_inode_key_state_reset : () -> () !{mem} @{}
+  //
+  // Clear the key-state flag to 0 (locked). Consumers call this at
+  // session teardown so a subsequent session cannot inherit a
+  // stale "unlocked" flag from a previous cp invocation.
+  //
+  // Leaf function; r11 scratch; no push/pop parity to preserve.
+  // ============================================================================
+  pub let signed_inode_key_state_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-cap.M3-002 signed_inode_key_state_reset. Zero the signed_inode_key_state slot so a subsequent session starts in the LOCKED state. xor rax,rax; lea r11,[rip+state]; mov [r11],rax. Same one-line-per-slot pattern as cap_reset (cap.pdx M1-001), caps_decl_reset (caps_decl.pdx M1-002), and kind_user_ref_reset (kind_user_ref.pdx M3-001). r11 is scratch (paideia-as conformance). Leaf function; no callee-save touched.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + signed_inode_key_state];
+        mov [r11], rax;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // signed_inode_key_state_set(state)
+  //
+  // Signature: signed_inode_key_state_set : (u64) -> () !{mem} @{}
+  // RDI (input): state — 0 (locked) or 1 (unlocked). Any other value
+  //                      is stored verbatim but treated as locked by
+  //                      the reader (`signed_inode_can_resign`).
+  //
+  // Consumer contract: after the login path (design/user/model.md
+  // §2.2) unlocks the invoker's user_sk into a Cap<KIND_MEMORY>, the
+  // login-shell calls `signed_inode_key_state_set(1)` before spawning
+  // any cp/mv/rm child. The child inherits the flag through the
+  // libpdx-cap .bss image (subject to the process-per-tool exec
+  // model: the flag lives in the CHILD's .bss and the child re-runs
+  // `signed_inode_key_state_set(1)` early in its own _start based on
+  // an InitCap-seeded hint the shell writes).
+  //
+  // Leaf function; r11 scratch.
+  // ============================================================================
+  pub let signed_inode_key_state_set : (u64) -> () !{mem} @{} =
+    fn (state: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-cap.M3-002 signed_inode_key_state_set. Store rdi to the signed_inode_key_state slot verbatim. No validation — any value is accepted; the reader (signed_inode_can_resign) treats any non-1 value as locked, so a caller passing garbage produces the fail-safe unsigned-destination behavior rather than a spurious success. lea r11,[rip+state]; mov [r11],rdi. r11 is scratch (paideia-as conformance). Leaf function; no callee-save touched.",
+      block: {
+        lea r11, [rip + signed_inode_key_state];
+        mov [r11], rdi;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // signed_inode_has_signature(inode_ptr) -> rc
+  //
+  // Signature: signed_inode_has_signature : (u64) -> u64 !{mem} @{}
+  // RDI (input): inode_ptr — VA of an inode buffer. The head at
+  //                          [inode_ptr .. inode_ptr + INODE_HEAD_BYTES]
+  //                          is the inode fields; [inode_ptr + 64] is
+  //                          the sig_present byte.
+  // RAX (output):
+  //     1                            — signature present ([+64] == 1)
+  //     0                            — signature absent  ([+64] == 0)
+  //     SIGNED_INODE_BAD_INODE       — inode_ptr == 0
+  //
+  // A caller distinguishes bad-inode from absent-signature by comparing
+  // rax against `SIGNED_INODE_BAD_INODE` (0xFFFFFFEF) rather than
+  // treating any non-1 return as "absent". This preserves the
+  // fail-fast discipline used throughout libpdx-cap.
+  //
+  // Register plan (leaf, no nested calls):
+  //   rax = byte load / return value
+  //   r11 = LEA scratch (inode_ptr + 64 address)
+  //
+  // Byte read uses the paideia-as #1248-safe pattern:
+  //   xor rax, rax; mov_b rax, [r11]
+  // ============================================================================
+  pub let signed_inode_has_signature : (u64) -> u64 !{mem} @{} =
+    fn (inode_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-cap.M3-002 signed_inode_has_signature. Reads the sig_present byte at [inode_ptr + 64] and returns 0 or 1 based on its value. inode_ptr == 0 refuses with SIGNED_INODE_BAD_INODE before any load, so a caller passing a null buffer cannot fault the process. Byte read via xor rax,rax; mov_b rax,[r11] per #1248 mitigation. Any sig_present value other than 1 is treated as absent (0) — a fail-safe if the on-disk layout ever encodes an intermediate state (e.g. 'partially verified'), the caller sees 'not present' and proceeds unsigned rather than assuming a signature that has not actually verified. paideia-as conformance: cmp rax,1 imm is a single-byte value; cmp rdi,0 uses cmp reg,imm=0; r11 is LEA scratch; no `test` mnemonic. Leaf function; no push/pop parity to preserve.",
+      block: {
+        cmp rdi, 0;
+        je _sih_bad;
+
+        mov r11, rdi;
+        add r11, 64;                    // SIG_PRESENT_OFFSET
+        xor rax, rax;
+        mov_b rax, [r11];
+
+        // Treat only the literal 1 as "present". Any other value
+        // (including 0) falls to the absent path.
+        cmp rax, 1;
+        je _sih_present;
+
+        xor rax, rax;                   // SIGNED_INODE_SIG_ABSENT numeric (0)
+        ret;
+
+      _sih_present:
+        mov rax, 1;
+        ret;
+
+      _sih_bad:
+        mov rax, 0xFFFFFFEF;            // SIGNED_INODE_BAD_INODE
+        ret
+      }
+    }
+
+  // ============================================================================
+  // signed_inode_can_resign() -> rc
+  //
+  // Signature: signed_inode_can_resign : () -> u64 !{mem} @{}
+  // RAX (output):
+  //     SIGNED_INODE_OK          — key_state == 1 (unlocked)
+  //     SIGNED_INODE_KEY_LOCKED  — key_state anything else
+  //
+  // Pure function of the key-state singleton. Consumer forks:
+  //   OK          → proceed to signed_inode_resign (a paideia-as
+  //                 v0.33-crypto intrinsic wrap; not in libpdx-cap yet).
+  //   KEY_LOCKED  → emit --verbose diagnostic + call
+  //                 signed_inode_mark_unsigned(dst) so the destination
+  //                 lands as a coherent unsigned inode.
+  //
+  // Register plan (leaf, no nested calls):
+  //   rax = key-state load / return value
+  //   r11 = LEA scratch
+  // ============================================================================
+  pub let signed_inode_can_resign : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-cap.M3-002 signed_inode_can_resign. Reads the signed_inode_key_state singleton and returns SIGNED_INODE_OK if it equals 1 (unlocked), SIGNED_INODE_KEY_LOCKED otherwise. The reader-side of the fail-safe convention documented at signed_inode_key_state_set: any non-1 value (including uninit garbage before signed_inode_key_state_reset has been called) reports LOCKED, so a caller cannot get a spurious 'can sign' back without having explicitly set the flag to 1. paideia-as conformance: cmp rax,1 imm is a single-byte value; large-imm return uses mov rax,imm32 (InitCap precedent); r11 is LEA scratch; no `test` mnemonic. Leaf function.",
+      block: {
+        lea r11, [rip + signed_inode_key_state];
+        mov rax, [r11];
+        cmp rax, 1;
+        je _scr_ok;
+
+        mov rax, 0xFFFFFFF0;            // SIGNED_INODE_KEY_LOCKED
+        ret;
+
+      _scr_ok:
+        xor rax, rax;                   // SIGNED_INODE_OK
+        ret
+      }
+    }
+
+  // ============================================================================
+  // signed_inode_mark_unsigned(dst_inode_ptr) -> rc
+  //
+  // Signature: signed_inode_mark_unsigned : (u64) -> u64 !{mem} @{}
+  // RDI (input): dst_inode_ptr — VA of the destination inode buffer.
+  // RAX (output):
+  //     SIGNED_INODE_OK          — sig_present byte set to 0
+  //     SIGNED_INODE_BAD_INODE   — dst_inode_ptr == 0 (no-op)
+  //
+  // Writes a single byte at [dst_inode_ptr + SIG_PRESENT_OFFSET]. Does
+  // NOT touch the inode head or the sig body region (if any). The
+  // caller is responsible for either truncating the destination
+  // buffer to UNSIGNED_INODE_TOTAL_BYTES (65) or leaving the stale
+  // sig body bytes in place — a downstream reader gates on the
+  // sig_present flag before consuming the sig body, so either
+  // physical layout produces the same semantic result.
+  //
+  // Register plan (leaf, no nested calls):
+  //   rax = 0 constant / return value
+  //   r11 = LEA scratch (dst + 64 address)
+  //
+  // Byte write via `mov_b [r11], rax` — mirror of caps_decl.pdx's
+  // NUL-terminate stores.
+  // ============================================================================
+  pub let signed_inode_mark_unsigned : (u64) -> u64 !{mem} @{} =
+    fn (dst_inode_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-cap.M3-002 signed_inode_mark_unsigned. Writes a 0 byte at [dst + 64] to clear the sig_present flag. dst == 0 refuses with SIGNED_INODE_BAD_INODE before any store, so a caller passing a null buffer cannot fault the process. mov_b [r11],rax with rax pre-zeroed via xor rax,rax — mirror of caps_decl.pdx's in-place NUL-terminate stores. Return value 0 is the SIGNED_INODE_OK constant (same numeric value, so xor rax,rax already produced it before the store; ret falls through with rax preserved). paideia-as conformance: cmp rdi,0; r11 LEA scratch; no `test`; large-imm return mov rax,0xFFFFFFEF for bad-inode. Leaf function.",
+      block: {
+        cmp rdi, 0;
+        je _smu_bad;
+
+        mov r11, rdi;
+        add r11, 64;                    // SIG_PRESENT_OFFSET
+        xor rax, rax;
+        mov_b [r11], rax;
+        // rax already 0 = SIGNED_INODE_OK
+        ret;
+
+      _smu_bad:
+        mov rax, 0xFFFFFFEF;            // SIGNED_INODE_BAD_INODE
+        ret
+      }
+    }
+}
