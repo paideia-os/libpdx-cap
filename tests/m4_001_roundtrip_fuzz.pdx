@@ -1,0 +1,305 @@
+// tests/m4_001_roundtrip_fuzz.pdx — libpdx-cap.M4-001
+// Round-trip fuzz witness: cap_pack + cap_unpack over 10^6 cap shapes.
+//
+// Design context
+// --------------
+// M4-001 rubric from design/tooling/r49-r50-plan.md §5.10 in
+// paideia-os:
+//
+//     "Round-trip fuzz (10^6 random cap shapes preserved)"
+//
+// The witness function `m4_001_roundtrip_fuzz` runs 10^6 iterations.
+// Each iteration derives (slot, kind, rights, target_ptr) from the
+// current 64-bit LCG state, calls `cap_pack` into `_m4rf_wire_buf`,
+// calls `cap_unpack`, and cmp-verifies the four singleton
+// `unpacked_*` slots against expected values recomputed from the
+// still-live LCG state in rbx (rbx is callee-save; both cap_pack
+// and cap_unpack preserve it per their published register plans in
+// src/cap.pdx).
+//
+// LCG (Knuth 64-bit MMIX, Numerical Recipes 3rd ed.):
+//
+//     state = state * 6364136223846793005 + 1442695040888963407
+//
+// Full-period 64-bit LCG — visits each of 2^64 states exactly once
+// before repeating. 10^6 iterations sample 10^6 distinct states from
+// that cycle; the resulting (slot, kind, rights, target_ptr) tuple
+// covers the pack/unpack surface densely enough that any bit-level
+// divergence in the lane packing (§2 of design/architecture.md)
+// surfaces at or before iteration 10^6.
+//
+// Derivation per iteration:
+//
+//     slot        = state & 0xFF                  (0..255; cap_pack accepts)
+//     kind        = (state >> 8) & 0xFFFF         (u16 wire lane)
+//     rights      = state >> 32                    (u32 wire lane; shr zero-extends)
+//     target_ptr  = state                          (full 64 bits)
+//
+// Slot is masked to [0..256) so `cap_pack` takes the success path
+// (CAP_SLOT_MAX = 256 per src/cap.pdx). The high 40 bits of state
+// participate via kind + rights + target_ptr, so no bit of state is
+// unused — an LCG advance that flips only high-order bits still
+// changes at least one lane compared to the previous iteration.
+//
+// Fingerprint contract
+// --------------------
+// `m4_001_roundtrip_fuzz() -> u64`
+//
+//     0   = all 10^6 iterations round-tripped without divergence.
+//     N   = 1-based iteration index at which the first divergence
+//           was observed. The offending iteration's inputs can be
+//           reproduced by advancing the LCG state (N-1) times from
+//           `M4RF_LCG_SEED`.
+//
+// On failure, the function also writes to two diagnostic slots:
+//
+//     _m4rf_fail_iter  — same 1-based iteration index the return
+//                        value carries.
+//     _m4rf_fail_field — which lane diverged:
+//                          0 = slot
+//                          1 = kind
+//                          2 = rights
+//                          3 = target_ptr
+//                          4 = cap_pack returned non-CAP_OK
+//                          5 = cap_unpack returned non-CAP_OK
+//
+// Both slots are cleared at prologue so a caller can read them
+// after the return without a pre-zero.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module name PascalCase basename (`M4RoundtripFuzz`), no
+//     directory prefix.
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses immediate ≤ 0x7FFFFFFF. The LCG
+//     multiplier (0x5851F42D4C957F2D), increment
+//     (0x14057B7EF767814F), and seed (0xC0FFEE5EA5CAB1E7) are
+//     staged via `mov r11, imm64` — the tsc.pdx / hpet.pdx
+//     precedent for large-imm arithmetic operands.
+//   - `r11` is scratch (paideia-as-reserved) and is used both for
+//     large-imm staging AND for LEA of the .bss diagnostic + wire
+//     buffer slots.
+//   - Byte reads N/A — every wire-buffer access is via `cap_pack`
+//     and `cap_unpack`, both qword-oriented.
+//   - Callee-save discipline: three pushes (rbx, r12, r13). Entry
+//     rsp % 16 == 8; three pushes -> rsp % 16 == 0 at every nested
+//     call site (`cap_pack`, `cap_unpack`). Matched pops at every
+//     exit preserve SysV parity. Same odd-push-count alignment
+//     trick as `kind_names_resolve` in src/kind_names.pdx (one
+//     push flips 8 → 0).
+//     - rbx = LCG state (preserved across cap_pack, cap_unpack —
+//       both are documented as touching only caller-save regs;
+//       cap_manifest_verify's five internal pushes are internal
+//       and do not concern us here).
+//     - r12 = 1-based iteration counter.
+//     - r13 = loop bound (M4RF_ITER_COUNT); loaded once, then used
+//       as the right-hand side of the loop-head `cmp r12, r13`.
+//   - `imul rbx, r11` uses the 2-operand truncated 64x64→64 form
+//     (same primitive tsc.pdx uses at src/kernel/core/time/tsc.pdx
+//     line 190 for TSC calibration).
+
+module M4RoundtripFuzz = structure {
+
+  // ============================================================================
+  // Public constants
+  // ============================================================================
+
+  // Iteration count. 10^6 fits `cmp reg, imm ≤ 0x7FFFFFFF` trivially
+  // (0xF4240 < 0x7FFFFFFF); still staged via `mov r11, imm; mov r13, r11`
+  // so the loop body reads a register, not an immediate — consistent
+  // with the rest of libpdx-cap's compare discipline.
+  pub let M4RF_ITER_COUNT : u64 = 1000000
+
+  // LCG parameters — Knuth 64-bit MMIX (Numerical Recipes 3rd ed.,
+  // Table 7.1.1). Full period 2^64; each 64-bit state visited
+  // exactly once per cycle.
+  pub let M4RF_LCG_MULT : u64 = 0x5851F42D4C957F2D
+  pub let M4RF_LCG_INCR : u64 = 0x14057B7EF767814F
+
+  // Fixed seed. Named + exported so a reproducer harness can
+  // re-derive the offending iteration's inputs after a failure.
+  pub let M4RF_LCG_SEED : u64 = 0xC0FFEE5EA5CAB1E7
+
+  // ============================================================================
+  // Diagnostic + scratch storage (.bss)
+  // ============================================================================
+
+  // 1-based iteration index of the first divergence. 0 = all-pass.
+  pub let mut _m4rf_fail_iter  : u64 = uninit @align(8)
+
+  // Lane id of the diverged lane (0..5 per contract above).
+  pub let mut _m4rf_fail_field : u64 = uninit @align(8)
+
+  // 16-byte round-trip wire buffer. cap_pack writes it, cap_unpack
+  // reads it. @align(8) matches the wire-format alignment discipline
+  // in design/architecture.md §2.
+  pub let mut _m4rf_wire_buf   : [u8; 16] = uninit @align(8)
+
+  // ============================================================================
+  // m4_001_roundtrip_fuzz() -> u64
+  //
+  // Signature: () -> u64 !{mem} @{}
+  // RAX (output): 0 on all-iterations-preserved; else the 1-based
+  //               iteration index at which the first divergence
+  //               was observed.
+  //
+  // The function is non-leaf (calls `cap_pack` and `cap_unpack` per
+  // iteration). Three callee-save pushes (rbx, r12, r13) preserve
+  // rsp % 16 == 0 at every nested-call site (entry 8; three pushes
+  // flip to 0). Matched pops at both exits.
+  // ============================================================================
+  pub let m4_001_roundtrip_fuzz : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-cap.M4-001 round-trip fuzz witness. Runs 10^6 iterations of an LCG-driven cap_pack + cap_unpack round-trip. Each iteration derives (slot, kind, rights, target_ptr) from the current 64-bit LCG state (rbx, callee-save), calls cap_pack into _m4rf_wire_buf, calls cap_unpack, and cmp-verifies the four unpacked_* singleton slots against expected values recomputed from the still-live state in rbx. rbx is preserved across the leaf cap_pack + cap_unpack calls per their published register plans. On the first divergence, records the 1-based iteration index in _m4rf_fail_iter, the lane id in _m4rf_fail_field, and returns the iteration index in rax; on all-pass returns 0. LCG constants (M4RF_LCG_MULT, M4RF_LCG_INCR, M4RF_LCG_SEED) exceed the paideia-as `cmp reg, imm ≤ 0x7FFFFFFF` window, so each is loaded via `mov r11, imm64` — the tsc.pdx precedent for large-imm arithmetic operands. `imul rbx, r11` is 2-operand truncated 64x64→64 (same primitive as tsc.pdx line 190). Three callee-save pushes (rbx, r12, r13) → rsp % 16 == 0 at every nested-call site (entry 8; three pushes flip to 0), matching kind_names_resolve's alignment trick in kind_names.pdx. paideia-as conformance: no `test` mnemonic; every direct `cmp reg, imm` uses a small imm (0xFF, 0xFFFF, 0); large-imm compares N/A (cap_pack + cap_unpack return CAP_OK which is 0); r11 scratch for imm staging + LEA of .bss slots; byte reads N/A (wire-buffer access is qword-oriented via cap_pack + cap_unpack).",
+      block: {
+        // ---- prologue ------------------------------------------------------
+        push rbx;
+        push r12;
+        push r13;
+
+        // Zero the two diagnostic slots so a caller reading them
+        // after the return sees the accurate final state (whether
+        // the return was 0 or a failure index).
+        xor rax, rax;
+        lea r11, [rip + _m4rf_fail_iter];   mov [r11], rax;
+        lea r11, [rip + _m4rf_fail_field];  mov [r11], rax;
+
+        // Seed the LCG.
+        mov r11, 0xC0FFEE5EA5CAB1E7;
+        mov rbx, r11;
+
+        // Load the loop bound into r13. Uses `mov r11, imm; mov r13, r11`
+        // rather than a direct `mov r13, imm32` so the loop-head compare
+        // reads a stable register — same idiom as caps_decl_parse's r9
+        // (end pointer) load-once discipline.
+        mov r11, 1000000;
+        mov r13, r11;
+
+        // r12 = iteration counter (1-based). Start at 1 so the fail
+        // return names an iteration index the reproducer harness can
+        // literally count to.
+        mov r12, 1;
+
+      // ==== per-iteration head ============================================
+      _m4rf_iter_head:
+        cmp r12, r13;
+        jg _m4rf_all_pass;                  // r12 > r13 → done
+
+        // ---- Compute derived (slot, kind, rights, target_ptr) from rbx.
+
+        // cap_pack args: rdi=dst, rsi=slot, rdx=kind, rcx=rights, r8=target_ptr.
+        lea rdi, [rip + _m4rf_wire_buf];
+
+        mov rsi, rbx;
+        and rsi, 0xFF;                      // slot = state & 0xFF
+
+        mov rdx, rbx;
+        shr rdx, 8;
+        and rdx, 0xFFFF;                    // kind = (state >> 8) & 0xFFFF
+
+        mov rcx, rbx;
+        shr rcx, 32;                        // rights = state >> 32 (zero-extended)
+
+        mov r8, rbx;                        // target_ptr = state
+
+        call cap_pack;
+
+        cmp rax, 0;
+        jne _m4rf_fail_pack;
+
+        // ---- Unpack the just-packed record.
+        lea rdi, [rip + _m4rf_wire_buf];
+        call cap_unpack;
+
+        cmp rax, 0;
+        jne _m4rf_fail_unpack;
+
+        // ---- Verify unpacked_slot == state & 0xFF.
+        mov rdi, rbx;
+        and rdi, 0xFF;
+        lea r11, [rip + unpacked_slot];
+        mov rax, [r11];
+        cmp rax, rdi;
+        jne _m4rf_fail_slot;
+
+        // ---- Verify unpacked_kind == (state >> 8) & 0xFFFF.
+        mov rdi, rbx;
+        shr rdi, 8;
+        and rdi, 0xFFFF;
+        lea r11, [rip + unpacked_kind];
+        mov rax, [r11];
+        cmp rax, rdi;
+        jne _m4rf_fail_kind;
+
+        // ---- Verify unpacked_rights == state >> 32.
+        mov rdi, rbx;
+        shr rdi, 32;
+        lea r11, [rip + unpacked_rights];
+        mov rax, [r11];
+        cmp rax, rdi;
+        jne _m4rf_fail_rights;
+
+        // ---- Verify unpacked_target_ptr == state (full 64 bits).
+        lea r11, [rip + unpacked_target_ptr];
+        mov rax, [r11];
+        cmp rax, rbx;
+        jne _m4rf_fail_target;
+
+        // ---- Advance LCG: state = state * mult + incr.
+        mov r11, 0x5851F42D4C957F2D;
+        imul rbx, r11;
+        mov r11, 0x14057B7EF767814F;
+        add rbx, r11;
+
+        // ---- Next iteration.
+        add r12, 1;
+        jmp _m4rf_iter_head;
+
+      // ==== exits =========================================================
+      _m4rf_all_pass:
+        xor rax, rax;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      _m4rf_fail_pack:
+        mov rdi, 4;
+        jmp _m4rf_record_fail;
+
+      _m4rf_fail_unpack:
+        mov rdi, 5;
+        jmp _m4rf_record_fail;
+
+      _m4rf_fail_slot:
+        xor rdi, rdi;                       // lane id 0
+        jmp _m4rf_record_fail;
+
+      _m4rf_fail_kind:
+        mov rdi, 1;
+        jmp _m4rf_record_fail;
+
+      _m4rf_fail_rights:
+        mov rdi, 2;
+        jmp _m4rf_record_fail;
+
+      _m4rf_fail_target:
+        mov rdi, 3;
+        // fall through to _m4rf_record_fail
+
+      _m4rf_record_fail:
+        // rdi = lane id. Record (iter, field) and return iter in rax.
+        lea r11, [rip + _m4rf_fail_iter];
+        mov [r11], r12;
+        lea r11, [rip + _m4rf_fail_field];
+        mov [r11], rdi;
+
+        mov rax, r12;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

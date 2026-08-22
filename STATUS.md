@@ -1,9 +1,8 @@
 # libpdx-cap — status
 
 **Wave:** R49 shared library
-**Current milestone:** M3 (audit + KIND_USER_ref decode + signed-inode
-helpers + rights-args-text refinement + KIND_TTY row) — CLOSED. Ready
-for M4 (round-trip fuzz + smoke matrix).
+**Current milestone:** M4 (test suite / smoke fixtures) — M4-001
+LANDED. M4-002 in flight.
 
 ## Milestone rollup
 
@@ -16,6 +15,8 @@ for M4 (round-trip fuzz + smoke matrix).
 | M2-003 (#5)     | rights-check at receive site (extra cap → reject)                              | LANDED |
 | M3-001 (#6)     | KIND_USER_ref decode helpers for ls --long owner rendering                     | LANDED |
 | M3-002 (#7)     | signed-inode helpers (re-sign under invoker user_sk if unlocked)               | LANDED |
+| M4-001 (#8)     | round-trip fuzz (10^6 random cap shapes)                                       | LANDED |
+| M4-002 (#9)     | caps.decl parse-error corpus + narrowing/extra-cap invariant matrix            | OPEN   |
 
 See `design/tooling/r49-r50-plan.md` §5.10 in paideia-os for the full
 milestone breakdown (M1–M5) and cross-repo dependencies.
@@ -73,6 +74,25 @@ milestone breakdown (M1–M5) and cross-repo dependencies.
   KindUserRef; "five modules" count), §5 (three new return codes),
   §8 (signed-inode exclusion marked ✓ landed at M3-002), §10 (NEW —
   SignedInode layout + consumer degrade path + explicit non-goals).
+
+## M4 summary (partial — through M4-001)
+
+### M4-001 (round-trip fuzz)
+
+- `tests/m4_001_roundtrip_fuzz.pdx` (NEW) — `M4RoundtripFuzz`
+  module with witness `m4_001_roundtrip_fuzz` (10^6 LCG-driven
+  `cap_pack` + `cap_unpack` iterations). Fingerprint contract:
+  `rax == 0` on all-pass; else the 1-based iteration index of
+  the first divergence. Companion diagnostic slots
+  `_m4rf_fail_iter` + `_m4rf_fail_field` (lane id: 0=slot,
+  1=kind, 2=rights, 3=target_ptr, 4=pack_rc, 5=unpack_rc).
+- `tests/README.md` — describes the M4-001 fingerprint contract
+  + the six lane-id values M4-001 can report.
+- LCG parameters (Knuth 64-bit MMIX; Numerical Recipes 3rd ed.,
+  Table 7.1.1) are `pub let` constants so a reproducer harness
+  can re-derive the offending iteration's inputs from
+  `M4RF_LCG_SEED = 0xC0FFEE5EA5CAB1E7` by advancing the LCG
+  `N-1` times.
 
 ## Consumer wiring (after M3)
 
