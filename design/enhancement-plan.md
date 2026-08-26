@@ -252,8 +252,9 @@ right home for the campaign. This pass does not file it.
 
 ## 4. Issue plan
 
-Nine issues would be over-filing; the list below is eight, each
-traceable to a cited defect above. Ordering matters: the two
+Nine issues, each traceable to a cited defect above; nothing here is
+manufactured, and the two smallest are one-line corrections that
+happen to matter more than their size. Ordering matters: the two
 documentation corrections and the code fixes must land *before* the
 manifest re-hash, or the manifest goes stale again on the next commit.
 
