@@ -236,6 +236,11 @@ Inferred, not individually verified: the remaining R50 coreutils
 (`cat`, `mkdir`, `mv`, `rm`), since exec-time reconciliation sits on the
 invocation path every tool with a `caps.decl` takes.
 
+See [`doc/INTEGRATION.md`](doc/INTEGRATION.md) for a copy-pasteable
+exec-time wiring sequence, the `ls` owner-column path as the one
+verified reference integration, and the M1→M3 migration `ls` can make
+now that `kind_user_ref_decode` has shipped.
+
 ## Version
 
 **v1.0.0**, tagged 2026-08-22 — milestones M1–M5 closed, public surface

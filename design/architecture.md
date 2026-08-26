@@ -18,7 +18,10 @@ libpdx-cap exposes five modules to its consumers (M3-001 adds
 `KindNames` module below):
 
 - `Cap` (`src/cap.pdx`) — the wire-format record + five entry points
-  every consumer wires at exec:
+  the exec-time flow below is *specified* to use (this is the intended
+  wiring, not a claim that every consumer already does it — see
+  `doc/INTEGRATION.md` §1 for which of these six have a real
+  production call site today):
   - `cap_pack(dst, slot, kind, rights, target_ptr) -> u64` — write a
     16-byte Cap record into `dst`; returns `CAP_OK` or `CAP_BAD_SLOT`.
   - `cap_pack_narrowed(dst, slot, kind, original_rights, narrowed_rights, target_ptr) -> u64`

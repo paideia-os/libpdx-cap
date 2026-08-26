@@ -6,6 +6,17 @@ each entry maps 1:1 to a GitHub milestone in this repo (see
 `design/tooling/r49-r50-plan.md` §5.10 in the
 [paideia-os](https://github.com/paideia-os/paideia-os) repo).
 
+## Unreleased
+
+Rolling notes for the Enhancement v1.x milestone (ENH-001..009);
+folded into a dated `1.0.1` entry by ENH-001 once the milestone
+closes.
+
+- `doc/INTEGRATION.md` (ENH-007) — exec-time wiring guide + the
+  `ls`-owner-column M1→M3 migration table, now that
+  `kind_user_ref_decode` (M3-001) has shipped and nothing had told
+  `ls` to move onto it.
+
 ## 1.0.0 — 2026-08-22
 
 **Milestone:** M5-001 (Issue #10).
