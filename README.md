@@ -67,7 +67,7 @@ from `0xFFFFFFFF` and cannot collide. All codes below carry an implicit
 | `FC` | `CAP_MANIFEST_MISSING` | `F4` | `CAP_KIND_UNKNOWN` / `KIND_NAMES_UNKNOWN` |
 | `FB` | `CAP_MANIFEST_EXTRA` | `F3` | `USER_REF_WRONG_KIND` |
 | `FA` | `CAPS_DECL_REQ_OVERFLOW` | `F2` | `USER_REF_BAD_ROW` |
-| `F9` | `CAPS_DECL_SCHEMA_OVERFLOW` | `F1` | `SIGNED_INODE_SIG_ABSENT` |
+| `F9` | `CAPS_DECL_SCHEMA_OVERFLOW` | `F1` | `SIGNED_INODE_SIG_ABSENT` (reserved-unused) |
 | `F8` | `CAPS_DECL_MALFORMED_HEADER` | `F0` | `SIGNED_INODE_KEY_LOCKED` |
 | `F7` | `CAPS_DECL_MALFORMED_ITEM` | `EF` | `SIGNED_INODE_BAD_INODE` |
 
@@ -187,9 +187,12 @@ Layout constants: `INODE_HEAD_BYTES = 64`, `SIG_PRESENT_OFFSET = 64`,
 The module supplies the layout and the gate, not the signature: the
 ML-DSA-65 sign primitive is a paideia-as `v0.33-crypto` intrinsic whose
 userspace linkage has not landed, so no `signed_inode_resign` exists
-yet and key material never enters this library. Note also that
-`signed_inode_has_signature` reports absence as literal `0`, not as the
-declared `SIGNED_INODE_SIG_ABSENT`.
+yet and key material never enters this library. `signed_inode_has_signature`'s
+contract is the literal u64 boolean `1` (present) / `0` (absent) /
+`SIGNED_INODE_BAD_INODE` (null `inode_ptr`); `SIGNED_INODE_SIG_ABSENT`
+(`0xFFFFFFF1`) is reserved-unused — no code path returns it, and its
+numeric slot stays reserved in the SignedInode band rather than being
+repurposed.
 
 ## Schemas exposed
 

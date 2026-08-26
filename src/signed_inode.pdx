@@ -93,9 +93,14 @@ module SignedInode = structure {
   // key-state singleton takes when unlocked.
   pub let SIGNED_INODE_OK           : u64 = 0
 
-  // has_signature: [inode_ptr + SIG_PRESENT_OFFSET] == 0.
-  // Also the sentinel a query returns when there is no signature to
-  // preserve on the destination.
+  // RESERVED, UNUSED (libpdx-cap#12). No code path returns this value.
+  // signed_inode_has_signature's actual contract is the literal u64
+  // boolean 1 (present) / 0 (absent) / SIGNED_INODE_BAD_INODE (null
+  // inode_ptr) — chosen over this sentinel because 1/0 is what the
+  // M4-002 witness (stages S20-S21) already asserts, and redefining a
+  // frozen 1.0 return value would be the breaking change. The numeric
+  // slot 0xFFFFFFF1 stays reserved in the SignedInode band so no
+  // future code accidentally reuses it for something else.
   pub let SIGNED_INODE_SIG_ABSENT   : u64 = 0xFFFFFFF1
 
   // can_resign: signed_inode_key_state == 0 (locked). Consumer
@@ -262,7 +267,9 @@ module SignedInode = structure {
         cmp rax, 1;
         je _sih_present;
 
-        xor rax, rax;                   // SIGNED_INODE_SIG_ABSENT numeric (0)
+        xor rax, rax;                   // absent: literal 0 (libpdx-cap#12 —
+                                         // NOT the reserved-unused
+                                         // SIGNED_INODE_SIG_ABSENT constant)
         ret;
 
       _sih_present:

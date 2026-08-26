@@ -67,7 +67,7 @@ Future codes extend downward from `0xFFFFFFEF`.
 | `0xFFFFFFF4` | `CAP_KIND_UNKNOWN` / `KIND_NAMES_UNKNOWN` | Cap + KindNames |
 | `0xFFFFFFF3` | `USER_REF_WRONG_KIND`           | KindUserRef |
 | `0xFFFFFFF2` | `USER_REF_BAD_ROW`              | KindUserRef |
-| `0xFFFFFFF1` | `SIGNED_INODE_SIG_ABSENT`       | SignedInode |
+| `0xFFFFFFF1` | `SIGNED_INODE_SIG_ABSENT` (reserved-unused; `signed_inode_has_signature` returns literal `0`/`1`) | SignedInode |
 | `0xFFFFFFF0` | `SIGNED_INODE_KEY_LOCKED`       | SignedInode |
 | `0xFFFFFFEF` | `SIGNED_INODE_BAD_INODE`        | SignedInode |
 

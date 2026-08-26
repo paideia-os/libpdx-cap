@@ -253,7 +253,8 @@ apart by the code prefix families this document reserves:
   matching value).
 - `0xFFFFFFF3` — KindUserRef M3-001 (`USER_REF_WRONG_KIND`).
 - `0xFFFFFFF2` — KindUserRef M3-001 (`USER_REF_BAD_ROW`).
-- `0xFFFFFFF1` — SignedInode M3-002 (`SIGNED_INODE_SIG_ABSENT`).
+- `0xFFFFFFF1` — SignedInode M3-002 (`SIGNED_INODE_SIG_ABSENT`,
+  reserved-unused as of ENH-003/libpdx-cap#12 — see §10).
 - `0xFFFFFFF0` — SignedInode M3-002 (`SIGNED_INODE_KEY_LOCKED`).
 - `0xFFFFFFEF` — SignedInode M3-002 (`SIGNED_INODE_BAD_INODE`).
 
@@ -464,7 +465,12 @@ ships. It publishes:
     passes (validation-free; only the value `1` unlocks the resign
     path, so garbage values fail closed).
   - `signed_inode_has_signature(inode_ptr) -> rc` — byte-flag query
-    (`1` present, `0` absent, `SIGNED_INODE_BAD_INODE` on null).
+    (`1` present, `0` absent, `SIGNED_INODE_BAD_INODE` on null). The
+    `0`/absent case is the literal integer, not the declared
+    `SIGNED_INODE_SIG_ABSENT` constant — resolved at ENH-003
+    (libpdx-cap#12) as reserved-unused rather than redefining a
+    frozen 1.0 return value; the M4-002 witness (S20-S21) already
+    asserts the 1/0 shape.
   - `signed_inode_can_resign() -> rc` — pure function of key-state
     (`SIGNED_INODE_OK` if unlocked, else `SIGNED_INODE_KEY_LOCKED`).
   - `signed_inode_mark_unsigned(dst) -> rc` — writes 0 to
