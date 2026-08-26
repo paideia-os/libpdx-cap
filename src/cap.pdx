@@ -185,11 +185,13 @@ module Cap = structure {
   pub let cap_pack : (u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
     fn (dst: u64) (slot: u64) (kind: u64) (rights: u64) (target_ptr: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-cap.M1-001 cap_pack. Two-qword store: qword0 fuses slot|kind|rights (16+16+32 bits) with a single OR-chain, qword1 is target_ptr. Slot bound: cmp rsi,CAP_SLOT_MAX; jge cap_pack_bad_slot before any write to dst so a rejected pack leaves the caller's buffer untouched. r10 holds the 0xFFFF mask for the slot / kind lanes (both fit in cmp reg,imm ≤ 0x7FFFFFFF); rights lane needs no mask because the shl 32 discards the top 32 bits into the void. r11 is the shifted-field scratch, paideia-as-reserved. Leaf function — no push/pop parity to preserve. Return code CAP_OK (0) or CAP_BAD_SLOT (0xFFFFFFFE); the latter follows InitCap's INIT_CAPS_BAD_SLOT precedent (paideia-os init_caps.pdx) so the two validators return a shared vocabulary.",
+      justification: "libpdx-cap.M1-001 cap_pack. Two-qword store: qword0 fuses slot|kind|rights (16+16+32 bits) with a single OR-chain, qword1 is target_ptr. Slot bound: cmp rsi,CAP_SLOT_MAX; jae cap_pack_bad_slot before any write to dst so a rejected pack leaves the caller's buffer untouched. jae (unsigned) is deliberate — slot is a u64 and jge (signed) would fail open for slot >= 2^63 (libpdx-cap#13). r10 holds the 0xFFFF mask for the slot / kind lanes (both fit in cmp reg,imm ≤ 0x7FFFFFFF); rights lane needs no mask because the shl 32 discards the top 32 bits into the void. r11 is the shifted-field scratch, paideia-as-reserved. Leaf function — no push/pop parity to preserve. Return code CAP_OK (0) or CAP_BAD_SLOT (0xFFFFFFFE); the latter follows InitCap's INIT_CAPS_BAD_SLOT precedent (paideia-os init_caps.pdx) so the two validators return a shared vocabulary.",
       block: {
         // Step 1: slot bound. cmp rsi, 256. Fail-fast before any store.
+        // Unsigned compare (jae, not jge) — slot is u64; a signed jge
+        // reads slot >= 2^63 as negative and fails open (libpdx-cap#13).
         cmp rsi, 256;                       // CAP_SLOT_MAX = 256
-        jge cap_pack_bad_slot;
+        jae cap_pack_bad_slot;
 
         // Step 2: assemble qword0 = slot | (kind << 16) | (rights << 32).
         mov r10, 0xFFFF;                    // slot / kind lane mask
@@ -267,9 +269,10 @@ module Cap = structure {
         cmp rax, 0;
         jne _cpn_widening;
 
-        // Step 2: slot bound.
+        // Step 2: slot bound. Unsigned compare (jae, not jge) — see
+        // cap_pack's identical fix (libpdx-cap#13).
         cmp rsi, 256;                   // CAP_SLOT_MAX
-        jge _cpn_bad_slot;
+        jae _cpn_bad_slot;
 
         // Step 3: assemble qword0 = slot | (kind << 16) | (narrowed << 32).
         mov r10, 0xFFFF;                // slot / kind lane mask
