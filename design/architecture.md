@@ -625,18 +625,44 @@ under repeated parse because the parser's ident walker treats
 re-parse walks past the NUL to the next real boundary and stores
 the same identifier pointer.
 
+### Runnable harness (ENH-006 / libpdx-cap#15)
+
+`tests/harness.pdx` + `tools/run-tests.sh` link every `src/*.pdx`
+module plus the two witnesses into one hosted ELF64 executable
+(`ld`, exploiting that libpdx-cap's SC+ syscall IDs — `sys_write`
+= 1, `sys_exit` = 60 — are also the native Linux x86-64 syscall
+numbers, so the linked image runs directly with no paideia-os
+kernel or QEMU involved) and RUN it, closing the "wave-level
+harness is delivered by the first R49-wave tool" gap below —
+`ls` linked libpdx-cap at M3 and never delivered one. Exit `0` =
+both witnesses returned 0; exit `1` / `2` print the diverging
+M4-001 iteration / M4-002 stage index to stdout before exiting.
+
+Running this harness for the first time immediately caught a
+real bug: `caps_decl_parse`'s item-boundary dispatch NUL-terminated
+a list item's `'\n'` boundary in place and then unconditionally
+re-scanned FORWARD from that same position looking for a `'\n'`
+byte to find the line's end — but the boundary byte it needed to
+find was the one it had just destroyed. The scan walked into the
+next line instead, silently swallowing it as trailing content on
+the current item, so every OTHER item in any `requires:` /
+`declares_output_schemas:` section with 2+ items was dropped
+without error. Fixed by giving the post-store dispatch
+(`caps_item_tail`) a flag register (r14) distinguishing "boundary
+was `'\n'`/EOF, already at line end" from "boundary was `'('`/`'@'`/
+whitespace, real scan still needed" — see `src/caps_decl.pdx`'s
+`caps_item_ident_done_*` handlers and `caps_item_tail`.
+
 ### Consumer contract
 
-libpdx-cap has no test harness of its own — the wave-level
-harness is delivered by the first R49-wave tool that links
-libpdx-cap (per §5.10 of the paideia-os plan doc). Until that
-tool ships, the two witnesses are:
+The two witnesses are:
 
 - **Inspectable** — reviewers read the assertion sequence
   line-by-line to confirm coverage.
 - **Callable** — any userspace consumer can `call
   m4_001_roundtrip_fuzz` and `call m4_002_caps_decl_matrix`
-  from its `_start` and assert `rax == 0`.
+  from its `_start` and assert `rax == 0` — exactly what
+  `tests/harness.pdx` does.
 - **Re-runnable** — both witnesses can be re-invoked inside the
   same process. M4-001 is seed-deterministic; M4-002 is
   fixture-idempotent per the walker analysis above.

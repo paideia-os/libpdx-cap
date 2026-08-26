@@ -1,0 +1,239 @@
+// tests/harness.pdx — libpdx-cap.ENH-006
+// Runnable test harness: links the two M4 witnesses into one image and
+// actually executes them, closing the gap that #15 (ENH-006) exists to
+// fix — "the M4 witnesses have never been executed."
+//
+// Design context
+// --------------
+// `tools/build.sh` only assembles `src/*.pdx` and `tests/*.pdx` into
+// individual `.o` files; it links nothing and checks no return value.
+// The M4 gate was closed "by the existence + shape of the two
+// witnesses" (`tests/README.md`, pre-ENH-006), which means the
+// CHANGELOG's "10^6 LCG-driven iterations" claim had, until this file,
+// executed zero iterations.
+//
+// `_start` below calls `m4_001_roundtrip_fuzz` then (only if it passed)
+// `m4_002_caps_decl_matrix`, matching the two SC+ syscall IDs libpdx-cap's
+// consumers already rely on being stable (`sys_write` = 1, `sys_exit` =
+// 60 — the same IDs paideia-os's own userland uses, e.g.
+// `src/user/true.pdx`). Those IDs are also the native Linux x86-64
+// syscall numbers for write/exit, which is what makes this harness
+// runnable directly as a hosted ELF via `tools/run-tests.sh` (see that
+// script for the link step) without any paideia-os kernel or QEMU
+// involvement — exactly the freedom ENH-006's issue text leaves to the
+// implementer ("whether it runs under QEMU or as a hosted ELF").
+//
+// Exit code contract
+// -------------------
+//   0 — both witnesses returned 0 (all-pass). "PASS: ..." on stdout.
+//   1 — m4_001_roundtrip_fuzz diverged. Prints
+//       "M4-001 FAIL iter=<N>\n" (N = the 1-based iteration index,
+//       decimal) to stdout before exiting.
+//   2 — m4_002_caps_decl_matrix failed. Prints
+//       "M4-002 FAIL stage=<N>\n" (N = the 1-based stage index,
+//       decimal) to stdout before exiting.
+//
+// Printing the diagnostic index (not just a nonzero exit status) is
+// deliberate: ENH-006's fingerprint requires the script to "name the
+// diverging iteration or stage index," and a process exit code is
+// truncated to one byte on every POSIX-shaped ABI — useless for
+// M4-001's up-to-10^6 iteration count. `_harness_print_u64` below is
+// therefore genuinely needed, not decorative.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module name PascalCase basename (`Harness`), no directory prefix.
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Byte store via `mov_b [ptr], rax` per the #1248-safe idiom
+//     (signed_inode.pdx precedent) — the decimal-digit loop parks its
+//     div quotient in r8 across the store because rax is the required
+//     store source.
+//   - r11 scratch for LEA; r10 the digit-buffer write cursor.
+//   - `_start`: one callee-save push (rbx, holds the witness's return
+//     value across the two sys_write calls bracketing the digit
+//     print) — rsp % 16 == 0 at every nested-call site (entry 8; one
+//     push flips to 0). No pop needed before either exit path since
+//     sys_exit never returns.
+
+module Harness = structure {
+
+  // ============================================================================
+  // Fixed messages (.data; declared mut for uniformity with the rest of
+  // this library's style — never written after link time).
+  // ============================================================================
+
+  // "M4-001 FAIL iter=" = 17 bytes.
+  pub let mut _harness_msg_m4001 : [u8; 17] =
+    "M4-001 FAIL iter="
+
+  // "M4-002 FAIL stage=" = 18 bytes.
+  pub let mut _harness_msg_m4002 : [u8; 18] =
+    "M4-002 FAIL stage="
+
+  // "PASS: m4_001_roundtrip_fuzz + m4_002_caps_decl_matrix both returned 0\n" = 70 bytes.
+  pub let mut _harness_msg_pass : [u8; 70] =
+    "PASS: m4_001_roundtrip_fuzz + m4_002_caps_decl_matrix both returned 0\n"
+
+  pub let mut _harness_nl : [u8; 1] = "\n"
+
+  // Decimal-conversion scratch buffer. 20 bytes is enough for the
+  // largest u64 value (18446744073709551615 = 20 digits); the two
+  // witnesses' fail-index ranges (1..10^6 for M4-001, 1..30 for
+  // M4-002) never come close, but the routine is correct for any
+  // nonzero u64 input.
+  pub let mut _harness_digit_buf : [u8; 20] = uninit @align(8)
+
+  // ============================================================================
+  // _harness_print_u64(value) -> ()
+  //
+  // Signature: _harness_print_u64 : (u64) -> () !{mem, sysreg} @{fs}
+  // RDI (input): value — a NONZERO u64. Both call sites in `_start`
+  //                       only invoke this on a 1-based failure index,
+  //                       which is never 0, so the routine does not
+  //                       special-case value == 0.
+  //
+  // Writes the decimal ASCII representation of `value` to fd 1 via
+  // sys_write, most-significant digit first. Repeated div-by-10 peels
+  // off the LEAST significant digit first, so digits are built into
+  // the TAIL of _harness_digit_buf working backward from the cursor
+  // (r10), then the routine writes the slice [r10 .. buf+20).
+  //
+  // Register plan (leaf, all caller-save):
+  //   rax = div dividend / quotient
+  //   rdx = div remainder (becomes the ASCII digit after + 0x30)
+  //   r8  = quotient parked across the byte-store (the #1248-safe
+  //         mov_b idiom requires rax as the store source, so the
+  //         in-flight quotient needs a temporary home before the
+  //         store clobbers rax)
+  //   r9  = divisor constant (10)
+  //   r10 = write cursor into _harness_digit_buf (decrements per digit)
+  //   r11 = LEA / end-of-buffer scratch
+  // ============================================================================
+  pub let _harness_print_u64 : (u64) -> () !{mem, sysreg} @{fs} =
+    fn (value: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "libpdx-cap.ENH-006 harness helper. Converts a nonzero u64 to decimal ASCII by repeated div-by-10 (quotient in rax, remainder in rdx per the x86-64 `div r64` contract: rdx:rax / r9 -> rax=quotient, rdx=remainder), peeling the least-significant digit first into the tail of _harness_digit_buf and walking the cursor (r10) backward. Because the #1248-safe byte-store idiom requires the store source to be rax (`mov_b [ptr], rax` — see signed_inode.pdx's mark_unsigned for the precedent), the quotient div just produced must be parked in r8 before rax is overwritten with the ASCII digit for the store, then restored into rax afterward so the loop's `cmp rax, 0` sees the real quotient rather than the digit byte. r9 holds the constant divisor 10 (div's divisor operand must be a register, not an immediate). Leaf function; no push/pop parity to preserve.",
+      block: {
+        lea r10, [rip + _harness_digit_buf];
+        add r10, 20;                    // r10 = one-past-the-end cursor
+        mov rax, rdi;                   // rax = value (dividend)
+
+      _hpu_loop:
+        xor rdx, rdx;
+        mov r9, 10;
+        div r9;                         // rax = rax/10, rdx = rax%10
+        mov r8, rax;                    // park quotient (rax about to be clobbered)
+        mov rax, rdx;
+        add rax, 0x30;                  // '0' + digit
+        dec r10;
+        mov_b [r10], rax;
+        mov rax, r8;                    // restore quotient
+        cmp rax, 0;
+        jne _hpu_loop;
+
+        // Write [r10 .. _harness_digit_buf + 20) to fd 1.
+        lea r11, [rip + _harness_digit_buf];
+        add r11, 20;
+        mov rdx, r11;
+        sub rdx, r10;                   // rdx = digit count
+
+        mov rdi, 1;                     // fd = stdout
+        mov rsi, r10;                   // buf = first digit
+        mov rax, 1;                     // SC+ ID 1 (sys_write)
+        syscall;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // _start — harness entry point.
+  //
+  // Runs m4_001_roundtrip_fuzz, then (only if it passed)
+  // m4_002_caps_decl_matrix. See the module header for the exit-code
+  // contract.
+  //
+  // Register plan (non-leaf; calls m4_001_roundtrip_fuzz,
+  // m4_002_caps_decl_matrix, _harness_print_u64):
+  //   rbx = witness return value, held across the label sys_write /
+  //         _harness_print_u64 / newline sys_write sequence on a
+  //         failure path (rbx is callee-save; none of the three calls
+  //         touch it — all are documented caller-save-only).
+  //
+  // One callee-save push (rbx) -> rsp % 16 == 0 at every nested-call
+  // site (entry 8; one push flips to 0). No matching pop before either
+  // exit path: sys_exit never returns.
+  // ============================================================================
+  pub let _start : () -> () !{mem, sysreg} @{fs, sched} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs, sched},
+      justification: "libpdx-cap.ENH-006 tests/harness.pdx _start. Calls m4_001_roundtrip_fuzz; on nonzero rax, prints 'M4-001 FAIL iter=<N>\\n' (label sys_write, _harness_print_u64, newline sys_write) and exits 1 via sys_exit (SC+ ID 60). Otherwise calls m4_002_caps_decl_matrix; on nonzero rax, prints 'M4-002 FAIL stage=<N>\\n' the same way and exits 2. If both return 0, prints the PASS line and exits 0. rbx holds the witness's return value across the three-call print sequence on a failure path; it is callee-save and none of sys_write / _harness_print_u64 / the witnesses touch it. Non-leaf: one callee-save push (rbx) -> rsp % 16 == 0 at every nested-call site (entry 8; one push flips to 0). No pop before either sys_exit call since it never returns.",
+      block: {
+        push rbx;
+
+        call m4_001_roundtrip_fuzz;
+        cmp rax, 0;
+        je _h_check_m4002;
+
+        mov rbx, rax;                   // save failing iteration index
+
+        mov rdi, 1;
+        lea rsi, [rip + _harness_msg_m4001];
+        mov rdx, 17;
+        mov rax, 1;
+        syscall;
+
+        mov rdi, rbx;
+        call _harness_print_u64;
+
+        mov rdi, 1;
+        lea rsi, [rip + _harness_nl];
+        mov rdx, 1;
+        mov rax, 1;
+        syscall;
+
+        mov rdi, 1;                     // exit status 1 (M4-001 failed)
+        mov rax, 60;
+        syscall;
+        hlt;
+
+      _h_check_m4002:
+        call m4_002_caps_decl_matrix;
+        cmp rax, 0;
+        je _h_pass;
+
+        mov rbx, rax;                   // save failing stage index
+
+        mov rdi, 1;
+        lea rsi, [rip + _harness_msg_m4002];
+        mov rdx, 18;
+        mov rax, 1;
+        syscall;
+
+        mov rdi, rbx;
+        call _harness_print_u64;
+
+        mov rdi, 1;
+        lea rsi, [rip + _harness_nl];
+        mov rdx, 1;
+        mov rax, 1;
+        syscall;
+
+        mov rdi, 2;                     // exit status 2 (M4-002 failed)
+        mov rax, 60;
+        syscall;
+        hlt;
+
+      _h_pass:
+        mov rdi, 1;
+        lea rsi, [rip + _harness_msg_pass];
+        mov rdx, 70;
+        mov rax, 1;
+        syscall;
+
+        xor rdi, rdi;                   // exit status 0 (all-pass)
+        mov rax, 60;
+        syscall;
+        hlt
+      }
+    }
+}

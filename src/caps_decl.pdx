@@ -151,15 +151,19 @@ module CapsDecl = structure {
   // (0-indexed) and returns the same code in rax; consumers can render
   // a diagnostic without a second load.
   //
-  // Register plan (leaf, but uses two callee-save regs for line_index
-  // + end preservation — two pushes preserve SysV parity because the
-  // function makes NO nested calls):
+  // Register plan (leaf, but uses three callee-save regs — three
+  // pushes preserve SysV parity because the function makes NO nested
+  // calls):
   //   r8  = cursor (running byte pointer into src)
   //   r9  = end   (src + src_len; loaded once, never mutated)
   //   r10 = state (STATE_TOP/REQ/SCH)
   //   r11 = scratch (LEA target for every .bss store; masking scratch)
   //   r12 = line_index (0-based; incremented at end of each line)  [callee-save]
-  //   r13 = walk cursor within current line  [callee-save]
+  //   r13 = walk cursor within current line / item-boundary pointer  [callee-save]
+  //   r14 = item-tail dispatch flag (libpdx-cap#15): 0 = caps_item_tail
+  //         must scan forward for the line's real '\n'; 1 = r13 already
+  //         IS the (consumed) line end, so caps_item_tail advances past
+  //         it directly  [callee-save]
   //   rax = byte load / return value scratch
   //   rcx = generic working cursor / count
   //   rdx = current-line pointer (line_start; used for item recording)
@@ -167,17 +171,21 @@ module CapsDecl = structure {
   pub let caps_decl_parse : (u64, u64) -> u64 !{mem} @{} =
     fn (src: u64) (src_len: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-cap.M1-002 caps_decl_parse. Line-oriented text parser for the caps.decl grammar (design/architecture.md §4). Walks src byte-by-byte with r8 as cursor, r9 as end (loaded once). State machine (r10) transitions TOP→REQ on 'requires:', TOP→SCH or REQ→SCH on 'declares_output_schemas:', TOP→TOP on '<hdr>: (none)'. In REQ / SCH, list items ('-') append to req_kind_names / schema_names with in-place NUL-termination at the item boundary (same idiom as tokenizer.pdx and libpdx-argv parser.pdx). Overflow gated at CAPS_DECL_MAX_REQ / CAPS_DECL_MAX_SCHEMAS before every write. paideia-as conformance: xor rax,rax; mov_b before every byte compare (#1248 mitigation); every cmp reg,imm uses imm ≤ 0x7FFFFFFF; r11 reserved as .bss LEA scratch. Two callee-save regs used (r12 line_index, r13 line-walk cursor) with matched push/pop; function makes NO nested calls so alignment is irrelevant.",
+      justification: "libpdx-cap.M1-002 caps_decl_parse (libpdx-cap#15 fix). Line-oriented text parser for the caps.decl grammar (design/architecture.md §4). Walks src byte-by-byte with r8 as cursor, r9 as end (loaded once). State machine (r10) transitions TOP→REQ on 'requires:', TOP→SCH or REQ→SCH on 'declares_output_schemas:', TOP→TOP on '<hdr>: (none)'. In REQ / SCH, list items ('-') append to req_kind_names / schema_names with in-place NUL-termination at the item boundary (same idiom as tokenizer.pdx and libpdx-argv parser.pdx). Overflow gated at CAPS_DECL_MAX_REQ / CAPS_DECL_MAX_SCHEMAS before every write. Post-store, caps_item_tail dispatches on r14 rather than unconditionally re-scanning for '\\n': when the item's own boundary WAS the line's '\\n' (or EOF), that byte was just NUL-terminated in place and a forward scan for a '\\n' at that position would walk into the NEXT line hunting for a newline that no longer exists there, silently swallowing it as trailing content on the current line — the bug this fix closes (every other multi-item list entry was dropped without error prior to ENH-006 shipping a runnable harness that could catch it). paideia-as conformance: xor rax,rax; mov_b before every byte compare (#1248 mitigation); every cmp reg,imm uses imm ≤ 0x7FFFFFFF; r11 reserved as .bss LEA scratch. Three callee-save regs used (r12 line_index, r13 line-walk cursor, r14 item-tail dispatch flag) with matched push/pop; function makes NO nested calls so alignment is irrelevant.",
       block: {
         // ---- prologue -------------------------------------------------------
         push r12;
         push r13;
+        push r14;
 
         mov r8, rdi;                    // r8 = cursor = src
         mov r9, rdi;
         add r9, rsi;                    // r9 = end = src + src_len
         xor r10, r10;                   // r10 = state = STATE_TOP (0)
         xor r12, r12;                   // r12 = line_index = 0
+        xor r14, r14;                   // r14 = item-tail dispatch flag (set
+                                         // per-item before every use; this
+                                         // init is defensive only)
 
       // ==== per-line loop head =============================================
       caps_line_head:
@@ -394,31 +402,59 @@ module CapsDecl = structure {
         add r13, 1;
         jmp caps_item_walk_ident;
 
-      // ---- Four boundary-byte terminations: NUL-terminate + branch --------
+      // ---- Boundary-byte terminations: NUL-terminate + branch -------------
+      //
+      // r14 is a two-way signal to the shared caps_item_tail (below,
+      // after caps_item_record_sch): 0 = the real end-of-line is still
+      // AHEAD of r13 and caps_item_tail must scan forward for it
+      // ('(' / '@' / ws boundaries — there is unconsumed args-text or
+      // an "@owner" suffix, or both, before the line's actual '\n').
+      // 1 = r13 already IS the line's end (the '\n' boundary, or EOF)
+      // — libpdx-cap#15 fix: NUL-terminating a '\n' boundary destroys
+      // the very sentinel a forward scan needs, so the old universal
+      // "mov r8,r13; jmp caps_line_skip_to_nl" tail silently walked
+      // into the NEXT line hunting for a '\n' that had already been
+      // consumed, swallowing every other list item without error.
       caps_item_ident_done_paren:
         // args-text begins at r13 (points to '('). NUL the '('. Record
         // args ptr = original r13 (before overwrite; kept in rax post-op).
         mov rcx, r13;                   // rcx = ptr to '(' for args record
         xor rax, rax;
         mov_b [r13], rax;               // NUL-terminate identifier
-        // Store item with args_text = rcx.
+        xor r14, r14;                   // scan needed: "@owner" may follow
         jmp caps_item_record;
 
       caps_item_ident_done_at:
       caps_item_ident_done_ws:
-      caps_item_ident_done_nl:
-        // Ident boundary. No args-text. Zero rcx before NUL so the store
-        // path sees args_text = 0.
+        // Ident boundary via '@' or whitespace. No args-text from this
+        // boundary itself. Zero rcx before NUL so the store path sees
+        // args_text = 0. More line content may still follow (the
+        // "@owner" suffix, or args-text reached via a run of spaces
+        // before '(') — scan needed.
         xor rcx, rcx;
         xor rax, rax;
         mov_b [r13], rax;               // NUL-terminate identifier
+        xor r14, r14;                   // scan needed
+        jmp caps_item_record;
+
+      caps_item_ident_done_nl:
+        // Ident boundary IS the line's '\n'. No args-text. r13 already
+        // points at the line's true end — libpdx-cap#15: signal
+        // caps_item_tail to consume it directly instead of re-scanning
+        // for a '\n' that this same instruction is about to destroy.
+        xor rcx, rcx;
+        xor rax, rax;
+        mov_b [r13], rax;               // NUL-terminate identifier
+        mov r14, 1;                     // already at (consumed) EOL
         jmp caps_item_record;
 
       caps_item_ident_done_eof:
         // Ident ran off the end. No trailing byte to NUL — the src
         // buffer's caller-owned invariant guarantees the byte past r9
-        // is not our concern. Record args_text = 0.
+        // is not our concern. Record args_text = 0. r13 == r9: nothing
+        // left to scan.
         xor rcx, rcx;
+        mov r14, 1;                     // already at true EOF
         jmp caps_item_record;
 
       // ---- Item record ----------------------------------------------------
@@ -449,9 +485,7 @@ module CapsDecl = structure {
         lea r11, [rip + req_count];
         mov [r11], rax;
 
-        // Advance past whatever remained on the line.
-        mov r8, r13;
-        jmp caps_line_skip_to_nl;
+        jmp caps_item_tail;
 
       caps_item_record_sch:
         lea r11, [rip + schema_count];
@@ -466,6 +500,26 @@ module CapsDecl = structure {
         lea r11, [rip + schema_count];
         mov [r11], rax;
 
+        jmp caps_item_tail;
+
+      // ---- Shared post-store tail (libpdx-cap#15 fix) ---------------------
+      //
+      // r14 (set by the boundary handler above): 0 = scan forward for
+      // the line's real trailing '\n' (caps_line_skip_to_nl, unchanged
+      // behavior); 1 = r13 already IS the (consumed) line end — bump
+      // past it directly and resume at the next line without
+      // re-scanning for a '\n' byte that no longer exists.
+      caps_item_tail:
+        cmp r14, 0;
+        je caps_item_tail_scan;
+
+        mov r8, r13;
+        add r8, 1;                      // step past the consumed '\n'
+        add r12, 1;                     // line_index++ (mirrors
+                                         // caps_line_consume_nl)
+        jmp caps_line_head;
+
+      caps_item_tail_scan:
         mov r8, r13;
         jmp caps_line_skip_to_nl;
 
@@ -530,6 +584,7 @@ module CapsDecl = structure {
         // Fall through to epilogue with rax preserved.
 
       caps_parse_epilogue:
+        pop r14;
         pop r13;
         pop r12;
         ret

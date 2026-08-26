@@ -249,9 +249,13 @@ session state. Requires paideia-as ≥ v0.33 (`mov_b` narrow load,
 
 `tests/` ships two self-contained witnesses linkable by any consumer:
 `m4_001_roundtrip_fuzz.pdx` (10^6-iteration pack/unpack round-trip) and
-`m4_002_caps_decl_matrix.pdx` (22-stage parser, narrowing, extra-cap,
-signed-inode matrix). Both return 0 on pass, else the 1-based index of
-the first failure.
+`m4_002_caps_decl_matrix.pdx` (30-stage parser, narrowing, extra-cap,
+signed-inode, and slot-bound matrix). Both return 0 on pass, else the
+1-based index of the first failure. `bash tools/run-tests.sh` links
+both witnesses (plus every `src/*.pdx` module and `tests/harness.pdx`)
+into one hosted ELF64 executable and actually runs it — exit `0` means
+both witnesses returned 0; `1` or `2` print the diverging M4-001
+iteration or M4-002 stage index before exiting nonzero.
 
 ## Examples
 
