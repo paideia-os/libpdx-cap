@@ -358,10 +358,14 @@ bug:
 - **~~cap_manifest_verify has no body.~~** ✓ Landed at M2-001 (this
   commit). Two-pass compare against the CapsDecl singleton driven by
   KindNames — see §7.
-- **No kind-transferable check in cap_pack.** M1 accepts any u16 kind.
-  M2-001 wires `CAP_BAD_KIND` up alongside manifest_verify's full logic
-  (the two features share the same `KIND_TRANSFERABLE_TABLE` — the
-  cap/kind.pdx analog to `KIND_SEEDABLE_TABLE`).
+- **~~No kind range bound in cap_pack.~~** ✓ Landed at ENH-009
+  (libpdx-cap#17): `cap_pack` and `cap_pack_narrowed` both reject
+  `kind >= 0x10000` with `CAP_BAD_KIND` before any store, instead of
+  silently truncating an out-of-range kind via the assemble step's
+  `& 0xFFFF`. **Still open:** the `KIND_TRANSFERABLE_TABLE` check —
+  whether a given in-range kind is *allowed* to cross a process
+  boundary at all — needs a paideia-os `cap/kind.pdx` mirror decision
+  and is out of scope for ENH-009; it belongs in its own issue.
 - **~~No rights-narrowing at send site.~~** ✓ Landed at M2-002 (this
   commit) as `cap_pack_narrowed`. Widen-check `(narrowed & ~original)
   == 0` refuses before touching `dst` with `CAP_RIGHTS_WIDENING`.

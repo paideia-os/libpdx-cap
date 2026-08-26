@@ -80,10 +80,11 @@ module Cap = structure {
   // InitCap validator has the mirror check on the receive side.
   pub let CAP_BAD_SLOT         : u64 = 0xFFFFFFFE
 
-  // Reserved for M2's kind check (kind not in the KIND_TRANSFERABLE
-  // set). M1's cap_pack does not enforce this — a caller can pack any
-  // u16 kind. M2 wires this up alongside cap_manifest_verify's full
-  // logic, at which point cap_pack picks up the same rejection.
+  // kind is out of the documented u16 range (>= 0x10000). Returned by
+  // cap_pack and cap_pack_narrowed before any store — landed at
+  // ENH-009 (libpdx-cap#17). This is the range bound only; whether an
+  // in-range kind belongs in the KIND_TRANSFERABLE set is a separate,
+  // still-open check (needs a paideia-os cap/kind.pdx mirror decision).
   pub let CAP_BAD_KIND         : u64 = 0xFFFFFFFD
 
   // cap_manifest_verify: the received cap set is MISSING a cap the
@@ -185,13 +186,19 @@ module Cap = structure {
   pub let cap_pack : (u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
     fn (dst: u64) (slot: u64) (kind: u64) (rights: u64) (target_ptr: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-cap.M1-001 cap_pack. Two-qword store: qword0 fuses slot|kind|rights (16+16+32 bits) with a single OR-chain, qword1 is target_ptr. Slot bound: cmp rsi,CAP_SLOT_MAX; jae cap_pack_bad_slot before any write to dst so a rejected pack leaves the caller's buffer untouched. jae (unsigned) is deliberate — slot is a u64 and jge (signed) would fail open for slot >= 2^63 (libpdx-cap#13). r10 holds the 0xFFFF mask for the slot / kind lanes (both fit in cmp reg,imm ≤ 0x7FFFFFFF); rights lane needs no mask because the shl 32 discards the top 32 bits into the void. r11 is the shifted-field scratch, paideia-as-reserved. Leaf function — no push/pop parity to preserve. Return code CAP_OK (0) or CAP_BAD_SLOT (0xFFFFFFFE); the latter follows InitCap's INIT_CAPS_BAD_SLOT precedent (paideia-os init_caps.pdx) so the two validators return a shared vocabulary.",
+      justification: "libpdx-cap.M1-001 cap_pack (kind bound added libpdx-cap#17). Two-qword store: qword0 fuses slot|kind|rights (16+16+32 bits) with a single OR-chain, qword1 is target_ptr. Slot bound: cmp rsi,CAP_SLOT_MAX; jae cap_pack_bad_slot before any write to dst so a rejected pack leaves the caller's buffer untouched. jae (unsigned) is deliberate — slot is a u64 and jge (signed) would fail open for slot >= 2^63 (libpdx-cap#13). Kind bound: cmp rdx,0x10000; jae cap_pack_bad_kind — kind is documented u16 but arrives as u64; without this bound `and rax,0xFFFF` at the assemble step silently truncates an out-of-range kind (e.g. 0x10190) to a well-formed but wrong KIND_* (e.g. 0x190). Checked after the slot bound and before any store, same fail-fast discipline. r10 holds the 0xFFFF mask for the slot / kind lanes (both fit in cmp reg,imm ≤ 0x7FFFFFFF); rights lane needs no mask because the shl 32 discards the top 32 bits into the void. r11 is the shifted-field scratch, paideia-as-reserved. Leaf function — no push/pop parity to preserve. Return code CAP_OK (0), CAP_BAD_SLOT (0xFFFFFFFE), or CAP_BAD_KIND (0xFFFFFFFD).",
       block: {
         // Step 1: slot bound. cmp rsi, 256. Fail-fast before any store.
         // Unsigned compare (jae, not jge) — slot is u64; a signed jge
         // reads slot >= 2^63 as negative and fails open (libpdx-cap#13).
         cmp rsi, 256;                       // CAP_SLOT_MAX = 256
         jae cap_pack_bad_slot;
+
+        // Step 1b: kind bound. kind is documented u16; reject anything
+        // that would be silently truncated by the & 0xFFFF below
+        // (libpdx-cap#17). Fail-fast before any store.
+        cmp rdx, 0x10000;
+        jae cap_pack_bad_kind;
 
         // Step 2: assemble qword0 = slot | (kind << 16) | (rights << 32).
         mov r10, 0xFFFF;                    // slot / kind lane mask
@@ -217,6 +224,10 @@ module Cap = structure {
 
       cap_pack_bad_slot:
         mov rax, 0xFFFFFFFE;                // CAP_BAD_SLOT
+        ret;
+
+      cap_pack_bad_kind:
+        mov rax, 0xFFFFFFFD;                // CAP_BAD_KIND
         ret
       }
     }
@@ -260,7 +271,7 @@ module Cap = structure {
   pub let cap_pack_narrowed : (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
     fn (dst: u64) (slot: u64) (kind: u64) (original_rights: u64) (narrowed_rights: u64) (target_ptr: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-cap.M2-002 cap_pack_narrowed. Cap-forwarding helper: writes a narrowed Cap only after proving the requested rights are a strict subset of the currently-held rights. The widen check `(narrowed & ~original) == 0` is computed as `mov rax, rcx; not rax; and rax, r8` — if the result is non-zero, at least one bit was set in narrowed_rights that was clear in original_rights (widening), refused with CAP_RIGHTS_WIDENING before any store to dst. Slot bound (cmp rsi, 256) reuses cap_pack's precedent and is checked AFTER the widen check so a widening attempt surfaces even on an otherwise-bad slot. Two-qword store body (qword0 = slot|kind|rights, qword1 = target_ptr) is identical to cap_pack — same register plan, same paideia-as compliance (r11 scratch, no cmp imm > 0x7FFFFFFF, no `test`). Leaf function; no push/pop parity to preserve.",
+      justification: "libpdx-cap.M2-002 cap_pack_narrowed (kind bound added libpdx-cap#17). Cap-forwarding helper: writes a narrowed Cap only after proving the requested rights are a strict subset of the currently-held rights. The widen check `(narrowed & ~original) == 0` is computed as `mov rax, rcx; not rax; and rax, r8` — if the result is non-zero, at least one bit was set in narrowed_rights that was clear in original_rights (widening), refused with CAP_RIGHTS_WIDENING before any store to dst. Slot bound (cmp rsi, 256; jae) reuses cap_pack's precedent and is checked AFTER the widen check so a widening attempt surfaces even on an otherwise-bad slot. Kind bound (cmp rdx, 0x10000; jae) is checked right after the slot bound, same rationale as cap_pack#17 — kind is u16-documented but arrives as u64 and the assemble step's & 0xFFFF would otherwise silently truncate. Two-qword store body (qword0 = slot|kind|rights, qword1 = target_ptr) is identical to cap_pack — same register plan, same paideia-as compliance (r11 scratch, no cmp imm > 0x7FFFFFFF, no `test`). Leaf function; no push/pop parity to preserve.",
       block: {
         // Step 1: widen check. rax = narrowed & ~original.
         mov rax, rcx;                   // rax = original
@@ -273,6 +284,10 @@ module Cap = structure {
         // cap_pack's identical fix (libpdx-cap#13).
         cmp rsi, 256;                   // CAP_SLOT_MAX
         jae _cpn_bad_slot;
+
+        // Step 2b: kind bound (libpdx-cap#17). Same rationale as cap_pack.
+        cmp rdx, 0x10000;
+        jae _cpn_bad_kind;
 
         // Step 3: assemble qword0 = slot | (kind << 16) | (narrowed << 32).
         mov r10, 0xFFFF;                // slot / kind lane mask
@@ -302,6 +317,10 @@ module Cap = structure {
 
       _cpn_bad_slot:
         mov rax, 0xFFFFFFFE;            // CAP_BAD_SLOT
+        ret;
+
+      _cpn_bad_kind:
+        mov rax, 0xFFFFFFFD;            // CAP_BAD_KIND
         ret
       }
     }
