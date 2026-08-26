@@ -567,7 +567,7 @@ and callable from any consumer that links libpdx-cap:
   seed (`M4RF_LCG_SEED = 0xC0FFEE5EA5CAB1E7`) so a failure at
   iteration `N` is reproducible.
 - `M4CapsDeclMatrix::m4_002_caps_decl_matrix` (M4-002) —
-  22-stage matrix covering:
+  30-stage matrix covering:
   - **Parse-error corpus (S1..S8):** OK inline, OK one-item,
     MALFORMED_HEADER (x2), ITEM_OUT_OF_SECTION, MALFORMED_ITEM,
     REQ_OVERFLOW, SCHEMA_OVERFLOW — one fixture per
@@ -588,6 +588,16 @@ and callable from any consumer that links libpdx-cap:
     `_set(1)` → `signed_inode_can_resign` fork, `has_signature`
     + `mark_unsigned` round-trip, `SIGNED_INODE_BAD_INODE`
     fail-fast on null input for both entries.
+  - **Slot-bound coverage (S23..S30):** added at ENH-005
+    (libpdx-cap#14) as the regression guard for the ENH-004
+    (libpdx-cap#13) signed-`jge` → unsigned-`jae` fix. `cap_pack`
+    and `cap_pack_narrowed` each get slot=255 (last accepted),
+    slot=256 and slot=`0xFFFF` (first-rejected and a mid-range
+    reject), and slot=`0x8000000000000000` (the case a signed
+    compare reads as negative and fails open). Every rejecting
+    case also asserts `dst` is left byte-for-byte untouched — the
+    fail-fast contract `src/cap.pdx:175` documents but which no
+    earlier stage exercised.
 
 ### Fingerprint contract
 

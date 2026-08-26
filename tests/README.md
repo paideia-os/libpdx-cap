@@ -9,7 +9,7 @@ correctness matrix defined in `design/tooling/r49-r50-plan.md`
 | File                            | Symbol                          | Milestone | What it proves                                                                                                     |
 |---------------------------------|---------------------------------|-----------|--------------------------------------------------------------------------------------------------------------------|
 | `m4_001_roundtrip_fuzz.pdx`     | `m4_001_roundtrip_fuzz`         | M4-001    | `cap_pack` + `cap_unpack` round-trip preserves all four wire lanes across 10^6 LCG-derived cap shapes.             |
-| `m4_002_caps_decl_matrix.pdx`   | `m4_002_caps_decl_matrix`       | M4-002    | 22-stage matrix: caps.decl parse-error corpus + narrowing-invariant matrix + extra-cap rejection + signed-inode.   |
+| `m4_002_caps_decl_matrix.pdx`   | `m4_002_caps_decl_matrix`       | M4-002    | 30-stage matrix: caps.decl parse-error corpus + narrowing-invariant matrix + extra-cap rejection + signed-inode + slot-bound coverage. |
 
 Both are pure userspace, non-leaf, self-contained. Each function
 returns `0` on all-pass, or a diagnostic index on the first failure
@@ -46,7 +46,7 @@ offending iteration's `(slot, kind, rights, target_ptr)` tuple.
   `// ---- Stage N: <desc>` comment in the function body.
 - `_m4mx_stage` mirrors the return value.
 
-The 22 stages cover four sub-corpora:
+The 30 stages cover five sub-corpora:
 
 | Range     | Sub-corpus                    | Fixtures / cases                                                                                    |
 |-----------|-------------------------------|-----------------------------------------------------------------------------------------------------|
@@ -54,6 +54,7 @@ The 22 stages cover four sub-corpora:
 | S9..S12   | Narrowing invariant           | subset OK, equal OK, superset WIDENING, empty-orig any-narrow WIDENING                              |
 | S13..S17  | Extra-cap rejection           | `cap_unpack_checked` EXTRA + OK; `cap_manifest_verify` MISSING + EXTRA + KIND_UNKNOWN               |
 | S18..S22  | Signed-inode re-sign          | KEY_LOCKED after reset; OK after set(1); has_signature+mark_unsigned round-trip; BAD_INODE fail-fast (x2) |
+| S23..S30  | Slot-bound coverage           | `cap_pack` + `cap_pack_narrowed`, each: slot=255 accept, slot=256/0xFFFF/2^63 CAP_BAD_SLOT with dst asserted untouched (libpdx-cap#14, regression guard for #13) |
 
 ## Consumer contract
 

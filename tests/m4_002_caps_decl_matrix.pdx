@@ -31,6 +31,16 @@
 //                                   transitions; has_signature +
 //                                   mark_unsigned round-trip;
 //                                   BAD_INODE fail-fast on null ptr.
+//   S23..S30 slot-bound coverage  — cap_pack / cap_pack_narrowed at
+//                                   the CAP_SLOT_MAX boundary (255
+//                                   accept, 256 + 0xFFFF + 2^63
+//                                   reject), added at ENH-005
+//                                   (libpdx-cap#14) as the regression
+//                                   guard for the ENH-004
+//                                   (libpdx-cap#13) signed-jge fix —
+//                                   every rejecting case also asserts
+//                                   dst is left byte-for-byte
+//                                   untouched.
 //
 // Fingerprint contract
 // --------------------
@@ -173,6 +183,11 @@ module M4CapsDeclMatrix = structure {
   // Signed-inode tests write the sig_present flag at offset 64.
   pub let mut _m4mx_inode_buf : [u8; 65] = uninit @align(8)
 
+  // One-Cap wire buffer dedicated to the slot-bound stages (S23..S30).
+  // Kept separate from _m4mx_cap_buf so the untouched-on-reject
+  // assertion never races a value another sub-corpus wrote earlier.
+  pub let mut _m4mx_slot_buf : [u8; 16] = uninit @align(8)
+
   // Current stage number — mirror of the return value. Written at
   // the top of every stage; on failure the caller can read it to
   // confirm which stage exited.
@@ -197,7 +212,7 @@ module M4CapsDeclMatrix = structure {
   pub let m4_002_caps_decl_matrix : () -> u64 !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-cap.M4-002 caps.decl matrix witness. Runs 22 stages covering (a) the 8-entry parse-error corpus for CapsDecl (OK inline, OK one-item, MALFORMED_HEADER x2, ITEM_OUT_OF_SECTION, MALFORMED_ITEM, REQ_OVERFLOW, SCHEMA_OVERFLOW), (b) the 4-case narrowing invariant matrix for cap_pack_narrowed (subset OK, equal OK, superset WIDENING, empty-orig any-narrow WIDENING), (c) the 5-case extra-cap rejection matrix for cap_unpack_checked + cap_manifest_verify (EXTRA on unpack, OK on unpack, MISSING on verify, EXTRA on verify, KIND_UNKNOWN on verify), and (d) the 5-case signed-inode helper suite (KEY_LOCKED after reset, OK after set(1), BAD_INODE on null has_signature, has_signature + mark_unsigned round-trip, BAD_INODE on null mark_unsigned). Each stage writes the 1-based stage index to _m4mx_stage before asserting; on the first failure returns that index in rax. On all-pass returns 0. paideia-as conformance: every large-imm compare (all CAPS_DECL_*, CAP_*, SIGNED_INODE_* error codes are 0xFFFFFFxx) uses `mov r11, imm32; cmp rax, r11` staging — same idiom as cap_manifest_verify line 580; every small-imm compare (0, 1, 0xFF, 0xFFFF) is direct. No `test` mnemonic. r11 is scratch (LEA + imm staging). Byte writes (setting sig_present=1 on the fixture inode) use `mov_b [r11], reg` — mirror of caps_decl.pdx's NUL-terminate store. Non-leaf: one callee-save push (rbx, unused; pure alignment pad) → rsp % 16 == 0 at every nested-call site. All state is in .bss; no cross-call callee-save reg needed. Fixtures are .data (mutable initialized) so `caps_decl_parse`'s in-place NUL-termination lands in writable memory; fixture text is idempotent under repeated parse per the module-header analysis (walker treats '\\0' as non-boundary so a re-parse walks past the NUL to the next boundary).",
+      justification: "libpdx-cap.M4-002 caps.decl matrix witness. Runs 30 stages covering (a) the 8-entry parse-error corpus for CapsDecl (OK inline, OK one-item, MALFORMED_HEADER x2, ITEM_OUT_OF_SECTION, MALFORMED_ITEM, REQ_OVERFLOW, SCHEMA_OVERFLOW), (b) the 4-case narrowing invariant matrix for cap_pack_narrowed (subset OK, equal OK, superset WIDENING, empty-orig any-narrow WIDENING), (c) the 5-case extra-cap rejection matrix for cap_unpack_checked + cap_manifest_verify (EXTRA on unpack, OK on unpack, MISSING on verify, EXTRA on verify, KIND_UNKNOWN on verify), (d) the 5-case signed-inode helper suite (KEY_LOCKED after reset, OK after set(1), BAD_INODE on null has_signature, has_signature + mark_unsigned round-trip, BAD_INODE on null mark_unsigned), and (e) the 8-case slot-bound suite added at ENH-005 (libpdx-cap#14) for cap_pack and cap_pack_narrowed each: slot=255 accept, slot=256/0xFFFF/0x8000000000000000 all CAP_BAD_SLOT with dst asserted byte-for-byte untouched (the ENH-004/libpdx-cap#13 signed-jge regression guard — a reverted jae would fail open on the 2^63 case and either corrupt dst or return CAP_OK). Each stage writes the 1-based stage index to _m4mx_stage before asserting; on the first failure returns that index in rax. On all-pass returns 0. paideia-as conformance: every large-imm compare (all CAPS_DECL_*, CAP_*, SIGNED_INODE_* error codes are 0xFFFFFFxx, plus the 0x8000000000000000 slot value and the 0xDEADBEEFCAFEBABE untouched-dst sentinel) uses `mov r11, imm64; cmp rax, r11` staging — same idiom as cap_manifest_verify line 580, extended to 64-bit immediates the same way tests/m4_001_roundtrip_fuzz.pdx stages its LCG constants; every small-imm compare (0, 1, 0xFF, 0xFFFF, 255, 256) is direct. No `test` mnemonic. r11 is scratch (LEA + imm staging); r10 is scratch for the slot-bound buffer address across the sentinel fill/check (never assumed live across a call — recomputed via `lea` after every nested call, matching the module's existing r11 discipline). Byte writes (setting sig_present=1 on the fixture inode) use `mov_b [r11], reg` — mirror of caps_decl.pdx's NUL-terminate store. Non-leaf: one callee-save push (rbx, unused; pure alignment pad) → rsp % 16 == 0 at every nested-call site. All state is in .bss; no cross-call callee-save reg needed. Fixtures are .data (mutable initialized) so `caps_decl_parse`'s in-place NUL-termination lands in writable memory; fixture text is idempotent under repeated parse per the module-header analysis (walker treats '\\0' as non-boundary so a re-parse walks past the NUL to the next boundary).",
       block: {
         // ---- prologue (alignment pad) --------------------------------------
         push rbx;
@@ -646,6 +661,225 @@ module M4CapsDeclMatrix = structure {
         xor rdi, rdi;
         call signed_inode_mark_unsigned;
         mov r11, 0xFFFFFFEF;              // SIGNED_INODE_BAD_INODE
+        cmp rax, r11;
+        jne _m4mx_fail;
+
+        // ====================================================================
+        // Sub-corpus E: slot-bound coverage (S23..S30) — ENH-005
+        // (libpdx-cap#14), regression guard for the ENH-004
+        // (libpdx-cap#13) signed-jge -> unsigned-jae fix.
+        // ====================================================================
+
+        // ---- Stage 23: cap_pack slot=255 (boundary) -> CAP_OK.
+        mov rax, 23;
+        lea r11, [rip + _m4mx_stage];
+        mov [r11], rax;
+
+        lea rdi, [rip + _m4mx_slot_buf];
+        mov rsi, 255;                     // CAP_SLOT_MAX - 1 (last accepted)
+        mov rdx, 0x197;                   // KIND_TTY
+        mov rcx, 1;
+        xor r8, r8;
+        call cap_pack;
+        cmp rax, 0;
+        jne _m4mx_fail;
+
+        // ---- Stage 24: cap_pack slot=256 -> CAP_BAD_SLOT; dst untouched.
+        mov rax, 24;
+        lea r11, [rip + _m4mx_stage];
+        mov [r11], rax;
+
+        lea r10, [rip + _m4mx_slot_buf];
+        mov r11, 0xDEADBEEFCAFEBABE;      // untouched-dst sentinel
+        mov [r10 + 0], r11;
+        mov [r10 + 8], r11;
+
+        lea rdi, [rip + _m4mx_slot_buf];
+        mov rsi, 256;                     // CAP_SLOT_MAX (first rejected)
+        mov rdx, 0x197;
+        mov rcx, 1;
+        xor r8, r8;
+        call cap_pack;
+        mov r11, 0xFFFFFFFE;              // CAP_BAD_SLOT
+        cmp rax, r11;
+        jne _m4mx_fail;
+
+        lea r10, [rip + _m4mx_slot_buf];
+        mov rax, [r10 + 0];
+        mov r11, 0xDEADBEEFCAFEBABE;
+        cmp rax, r11;
+        jne _m4mx_fail;
+        mov rax, [r10 + 8];
+        cmp rax, r11;
+        jne _m4mx_fail;
+
+        // ---- Stage 25: cap_pack slot=0xFFFF -> CAP_BAD_SLOT; dst untouched.
+        mov rax, 25;
+        lea r11, [rip + _m4mx_stage];
+        mov [r11], rax;
+
+        lea r10, [rip + _m4mx_slot_buf];
+        mov r11, 0xDEADBEEFCAFEBABE;
+        mov [r10 + 0], r11;
+        mov [r10 + 8], r11;
+
+        lea rdi, [rip + _m4mx_slot_buf];
+        mov rsi, 0xFFFF;
+        mov rdx, 0x197;
+        mov rcx, 1;
+        xor r8, r8;
+        call cap_pack;
+        mov r11, 0xFFFFFFFE;              // CAP_BAD_SLOT
+        cmp rax, r11;
+        jne _m4mx_fail;
+
+        lea r10, [rip + _m4mx_slot_buf];
+        mov rax, [r10 + 0];
+        mov r11, 0xDEADBEEFCAFEBABE;
+        cmp rax, r11;
+        jne _m4mx_fail;
+        mov rax, [r10 + 8];
+        cmp rax, r11;
+        jne _m4mx_fail;
+
+        // ---- Stage 26: cap_pack slot=0x8000000000000000 -> CAP_BAD_SLOT;
+        //                dst untouched. Regression guard: a reverted jae
+        //                (back to signed jge, libpdx-cap#13) reads this
+        //                slot as negative and falls through to CAP_OK.
+        mov rax, 26;
+        lea r11, [rip + _m4mx_stage];
+        mov [r11], rax;
+
+        lea r10, [rip + _m4mx_slot_buf];
+        mov r11, 0xDEADBEEFCAFEBABE;
+        mov [r10 + 0], r11;
+        mov [r10 + 8], r11;
+
+        lea rdi, [rip + _m4mx_slot_buf];
+        mov rsi, 0x8000000000000000;
+        mov rdx, 0x197;
+        mov rcx, 1;
+        xor r8, r8;
+        call cap_pack;
+        mov r11, 0xFFFFFFFE;              // CAP_BAD_SLOT
+        cmp rax, r11;
+        jne _m4mx_fail;
+
+        lea r10, [rip + _m4mx_slot_buf];
+        mov rax, [r10 + 0];
+        mov r11, 0xDEADBEEFCAFEBABE;
+        cmp rax, r11;
+        jne _m4mx_fail;
+        mov rax, [r10 + 8];
+        cmp rax, r11;
+        jne _m4mx_fail;
+
+        // ---- Stage 27: cap_pack_narrowed slot=255 (boundary) -> CAP_OK.
+        mov rax, 27;
+        lea r11, [rip + _m4mx_stage];
+        mov [r11], rax;
+
+        lea rdi, [rip + _m4mx_slot_buf];
+        mov rsi, 255;
+        mov rdx, 0x197;
+        mov rcx, 0xF;                     // original_rights
+        mov r8, 3;                        // narrowed_rights (subset)
+        xor r9, r9;
+        call cap_pack_narrowed;
+        cmp rax, 0;
+        jne _m4mx_fail;
+
+        // ---- Stage 28: cap_pack_narrowed slot=256 -> CAP_BAD_SLOT;
+        //                dst untouched.
+        mov rax, 28;
+        lea r11, [rip + _m4mx_stage];
+        mov [r11], rax;
+
+        lea r10, [rip + _m4mx_slot_buf];
+        mov r11, 0xDEADBEEFCAFEBABE;
+        mov [r10 + 0], r11;
+        mov [r10 + 8], r11;
+
+        lea rdi, [rip + _m4mx_slot_buf];
+        mov rsi, 256;
+        mov rdx, 0x197;
+        mov rcx, 0xF;
+        mov r8, 3;
+        xor r9, r9;
+        call cap_pack_narrowed;
+        mov r11, 0xFFFFFFFE;              // CAP_BAD_SLOT
+        cmp rax, r11;
+        jne _m4mx_fail;
+
+        lea r10, [rip + _m4mx_slot_buf];
+        mov rax, [r10 + 0];
+        mov r11, 0xDEADBEEFCAFEBABE;
+        cmp rax, r11;
+        jne _m4mx_fail;
+        mov rax, [r10 + 8];
+        cmp rax, r11;
+        jne _m4mx_fail;
+
+        // ---- Stage 29: cap_pack_narrowed slot=0xFFFF -> CAP_BAD_SLOT;
+        //                dst untouched.
+        mov rax, 29;
+        lea r11, [rip + _m4mx_stage];
+        mov [r11], rax;
+
+        lea r10, [rip + _m4mx_slot_buf];
+        mov r11, 0xDEADBEEFCAFEBABE;
+        mov [r10 + 0], r11;
+        mov [r10 + 8], r11;
+
+        lea rdi, [rip + _m4mx_slot_buf];
+        mov rsi, 0xFFFF;
+        mov rdx, 0x197;
+        mov rcx, 0xF;
+        mov r8, 3;
+        xor r9, r9;
+        call cap_pack_narrowed;
+        mov r11, 0xFFFFFFFE;              // CAP_BAD_SLOT
+        cmp rax, r11;
+        jne _m4mx_fail;
+
+        lea r10, [rip + _m4mx_slot_buf];
+        mov rax, [r10 + 0];
+        mov r11, 0xDEADBEEFCAFEBABE;
+        cmp rax, r11;
+        jne _m4mx_fail;
+        mov rax, [r10 + 8];
+        cmp rax, r11;
+        jne _m4mx_fail;
+
+        // ---- Stage 30: cap_pack_narrowed slot=0x8000000000000000 ->
+        //                CAP_BAD_SLOT; dst untouched. Regression guard,
+        //                same rationale as Stage 26.
+        mov rax, 30;
+        lea r11, [rip + _m4mx_stage];
+        mov [r11], rax;
+
+        lea r10, [rip + _m4mx_slot_buf];
+        mov r11, 0xDEADBEEFCAFEBABE;
+        mov [r10 + 0], r11;
+        mov [r10 + 8], r11;
+
+        lea rdi, [rip + _m4mx_slot_buf];
+        mov rsi, 0x8000000000000000;
+        mov rdx, 0x197;
+        mov rcx, 0xF;
+        mov r8, 3;
+        xor r9, r9;
+        call cap_pack_narrowed;
+        mov r11, 0xFFFFFFFE;              // CAP_BAD_SLOT
+        cmp rax, r11;
+        jne _m4mx_fail;
+
+        lea r10, [rip + _m4mx_slot_buf];
+        mov rax, [r10 + 0];
+        mov r11, 0xDEADBEEFCAFEBABE;
+        cmp rax, r11;
+        jne _m4mx_fail;
+        mov rax, [r10 + 8];
         cmp rax, r11;
         jne _m4mx_fail;
 
