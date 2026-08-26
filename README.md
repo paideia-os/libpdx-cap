@@ -58,14 +58,12 @@ buffers — the library does not check.
 Success is `0`. Failures use the `0xFFFFFFEF..0xFFFFFFFE` band reserved
 for this library — the loader's `INIT_CAPS_BAD_*` family extends upward
 from `0xFFFFFFFF` and cannot collide. All codes below carry an implicit
-`0xFFFFFF` prefix, and are read from `src/*.pdx`: note that the 1.0
-`CHANGELOG.md` table permutes the five `CAPS_DECL_*` symbols within
-their block.
+`0xFFFFFF` prefix, and are read from `src/*.pdx`.
 
 | code | symbol | code | symbol |
 |------|--------|------|--------|
 | `FE` | `CAP_BAD_SLOT` | `F6` | `CAPS_DECL_ITEM_OUT_OF_SECTION` |
-| `FD` | `CAP_BAD_KIND` (reserved) | `F5` | `CAP_RIGHTS_WIDENING` |
+| `FD` | `CAP_BAD_KIND` | `F5` | `CAP_RIGHTS_WIDENING` |
 | `FC` | `CAP_MANIFEST_MISSING` | `F4` | `CAP_KIND_UNKNOWN` / `KIND_NAMES_UNKNOWN` |
 | `FB` | `CAP_MANIFEST_EXTRA` | `F3` | `USER_REF_WRONG_KIND` |
 | `FA` | `CAPS_DECL_REQ_OVERFLOW` | `F2` | `USER_REF_BAD_ROW` |

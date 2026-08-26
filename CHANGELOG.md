@@ -18,7 +18,7 @@ library is now consumer-ready for the R49 tooling wave (`pkg`,
 `shell`, `doc`) and, transitively, for every R50 coreutil
 (`ls`, `cat`, `cp`, `mv`, `rm`, `mkdir`).
 
-### Public surface at 1.0 (five modules, 12 entry points)
+### Public surface at 1.0 (five modules, 20 entry points)
 
 - `Cap` (`src/cap.pdx`) — `cap_pack`, `cap_pack_narrowed`,
   `cap_unpack`, `cap_unpack_checked`, `cap_manifest_verify`.
@@ -58,11 +58,11 @@ Future codes extend downward from `0xFFFFFFEF`.
 | `0xFFFFFFFD` | `CAP_BAD_KIND`                  | Cap         |
 | `0xFFFFFFFC` | `CAP_MANIFEST_MISSING`          | Cap         |
 | `0xFFFFFFFB` | `CAP_MANIFEST_EXTRA`            | Cap         |
-| `0xFFFFFFFA` | `CAPS_DECL_MALFORMED_HEADER`    | CapsDecl    |
-| `0xFFFFFFF9` | `CAPS_DECL_MALFORMED_ITEM`      | CapsDecl    |
-| `0xFFFFFFF8` | `CAPS_DECL_ITEM_OUT_OF_SECTION` | CapsDecl    |
-| `0xFFFFFFF7` | `CAPS_DECL_REQ_OVERFLOW`        | CapsDecl    |
-| `0xFFFFFFF6` | `CAPS_DECL_SCHEMA_OVERFLOW`     | CapsDecl    |
+| `0xFFFFFFFA` | `CAPS_DECL_REQ_OVERFLOW`        | CapsDecl    |
+| `0xFFFFFFF9` | `CAPS_DECL_SCHEMA_OVERFLOW`     | CapsDecl    |
+| `0xFFFFFFF8` | `CAPS_DECL_MALFORMED_HEADER`    | CapsDecl    |
+| `0xFFFFFFF7` | `CAPS_DECL_MALFORMED_ITEM`      | CapsDecl    |
+| `0xFFFFFFF6` | `CAPS_DECL_ITEM_OUT_OF_SECTION` | CapsDecl    |
 | `0xFFFFFFF5` | `CAP_RIGHTS_WIDENING`           | Cap (M2-002)|
 | `0xFFFFFFF4` | `CAP_KIND_UNKNOWN` / `KIND_NAMES_UNKNOWN` | Cap + KindNames |
 | `0xFFFFFFF3` | `USER_REF_WRONG_KIND`           | KindUserRef |
