@@ -1,4 +1,4 @@
-# libpdx-cap release manifest — v1.0.0
+# libpdx-cap release manifest — v1.0.1
 #
 # Format: manifest.pdxsig v0.1 (per design/tooling/plan.md §6.3 in
 # paideia-os). The @-directives below are the source of record for a
@@ -14,10 +14,25 @@
 # ML-DSA-65 will produce; the signing bot overwrites bytes in place
 # without changing manifest byte count.
 #
-# NOTE — signature status for 1.0.0
-# ---------------------------------
+# NOTE — v1.0.0 WITHDRAWN; this is v1.0.1
+# ----------------------------------------
+# `v1.0.0` (tag `27c29e2`) attested a tree that does not assemble
+# (`src/cap.pdx:214` was missing a `;` before a fall-through label;
+# fixed three commits later at `da38a9e`, which the v1.0.0 tag
+# predates) and, independently, a hash tree that had already gone
+# stale for two artifacts by the time anyone re-verified it
+# (`README.md`, `src/cap.pdx`). Libpdx-cap#19 (ENH-001) cuts this
+# v1.0.1 manifest from a tree that has actually been assembled
+# (`paideia-as check` clean on every `src/*.pdx` + `tests/*.pdx`) and
+# whose M4 witnesses have actually been linked and run
+# (`bash tools/run-tests.sh` exits 0) — the first time either of
+# those has been true for a tagged libpdx-cap release. `v1.0.0` is
+# withdrawn; do not resolve `libpdx-cap @ ^1.0` to that tag.
+#
+# NOTE — signature status (unchanged since 1.0.0)
+# -------------------------------------------------
 # The two @-sig-slot blocks below carry 3309-byte all-zero placeholder
-# bodies. This is INTENTIONAL for 1.0.0 because:
+# bodies. This is INTENTIONAL because:
 #
 #   (1) The paideia-as v0.33-crypto ML-DSA-65 SIGN primitive is not
 #       yet exposed as a userspace intrinsic (paideia-as-team
@@ -29,26 +44,26 @@
 #   (2) The `pkgs.paideia-os` mirror (paideia-os T-INFRA-001) and the
 #       signing bot host (paideia-os T-INFRA-002) do not yet exist.
 #       When both come online the bot re-signs this manifest in place
-#       and republishes to `pkgs.paideia-os/main/libpdx-cap/1.0.0/`;
+#       and republishes to `pkgs.paideia-os/main/libpdx-cap/1.0.1/`;
 #       the byte-count-preserving slot shape means downstream verifiers
 #       ingest the same file at the same URL.
 #
-# The 1.0.0 tag on `github.com/paideia-os/libpdx-cap` is the immutable
+# The 1.0.1 tag on `github.com/paideia-os/libpdx-cap` is the immutable
 # authoritative source; the mirror push is a distribution optimisation.
 
-@manifest         libpdx-cap 1.0.0
+@manifest         libpdx-cap 1.0.1
 @license          MIT
 @wave             R49
 @kind             library
 @author           paideia-os-team
-@created          2026-08-22
+@created          2026-08-25
 @format-version   0.1
 @hash-algorithm   SHA-256
 @sig-algorithm    ML-DSA-65
 @sig-length       3309
 @upstream         github.com/paideia-os/libpdx-cap
-@upstream-tag     v1.0.0
-@mirror-target    pkgs.paideia-os/main/libpdx-cap/1.0.0/
+@upstream-tag     v1.0.1
+@mirror-target    pkgs.paideia-os/main/libpdx-cap/1.0.1/
 @doc-consumer     doc libpdx-cap  (via doc/libpdx-cap.pdxdoc)
 
 @dependencies     (none)                             # libpdx-cap.M1..M5 has no library deps
@@ -61,20 +76,23 @@
     M3  #6 #7          KIND_USER_ref + signed-inode helpers
     M4  #8 #9          round-trip fuzz + caps.decl matrix
     M5  #10            dual-signed release + .pdxdoc + mirror push
+    ENH #11 #12 #13 #14 #15 #16 #17     v1.x fixes + release hygiene (v1.0.0 withdrawn)
 
 @artifacts                                                                                sha256                                                              bytes
     caps.decl                                             b03dba4871d762d910d2d94aa68c4e957ae38834532392fa4022fc04d6de5576         1314
     LICENSE                                               5d10906e3e9407412fd51592e3dd968251a4797b8ffdcc9e862d8fb1f3925e2b         1112
-    README.md                                             a8506268a8cacb8fa9709e50f9c3bcc3ca45b7a6d42a4cc4bd8e21eb7ec56c94         2237
-    CHANGELOG.md                                          6dbc00b6332a748f4c8971e980c581299511fc7aca21e1d4b2ac25247d5012f7         5943
+    README.md                                             421fbab519c139361edf03ec20b11209143391b804c96845c6f39843ed731533        15935
+    CHANGELOG.md                                          747d7b04958673efb1a075c9aff4127b04b4f07190933303eb15618b19050987        10093
     doc/libpdx-cap.pdxdoc                                 c023d6036abc416ed466e643966cb5eef56b759ce750d91136f2cf53c44311c5        14766
-    src/cap.pdx                                           2a34fdb5517cc5a97b425c2ab2b6b1139d1b1f6a0ae2af5dae6b7e01c74d4b7e        32885
-    src/caps_decl.pdx                                     5bfde8683c30f82ddbb9225fa4a55a567b23e91c6e25dc40123745a5a4820d46        38350
+    doc/INTEGRATION.md                                    979f40c4675720ac5021b3362fbc685388a7ea01d67142867594e93269d19b39        10048
+    src/cap.pdx                                           c6eb0536b8cb76d92107ff9a67f78a216a327e45d8f4b9567a346585f288d809        34407
+    src/caps_decl.pdx                                     1567b4dbd41c0fe0efdf407119febd2a73d959ec9b51b16cd3438cf728c52a01        41858
     src/kind_names.pdx                                    9d33ee242e54e0ad42f45261e81482fff1b8481952a0df40d6b6af1b33d0d04c        15340
     src/kind_user_ref.pdx                                 67fa59c485dfbbc01b89562a49fe681801ba2904e3c4cb31d368833562542170        18622
-    src/signed_inode.pdx                                  34dd45d59b74306255bc040c2ffa6e05ce5718d0f506525b91a62c0b8fa3b978        18429
+    src/signed_inode.pdx                                  9a3b0ee08e73a499ea6edcd4f1914beadf2f5432781204bf5d36ba2dff0ed599        18962
     tests/m4_001_roundtrip_fuzz.pdx                       0a5a8a4a5f82ca8e2988cae3f4497478f77461ff9848288ee6341525e493838d        12887
-    tests/m4_002_caps_decl_matrix.pdx                     b2719aa54b5301c19fa31436a04113cb8cf82ec6f1a2c608944ef237b80e9d36        25566
+    tests/m4_002_caps_decl_matrix.pdx                     1c65a7910fe6ac6a9ba77292c7ebd86ada47755ca3cdcb1f7737d86c52ae3a53        33805
+    tests/harness.pdx                                     30e9aec53b6f7c8a66104aa0dbbbea0fb1a42629afb3202fcbb0fe3c811ff605        10948
 @end-artifacts
 
 # @manifest-body-hash is SHA-256 of every byte in this file from the
@@ -87,7 +105,7 @@
 # Signing bot inputs: this hash (the "message" to sign). Signing bot
 # output: overwrites the two @-sig-slot blocks below in place.
 
-@manifest-body-hash    c222bca34f44e39b9ed4902e18fcc22683c4c9ae2fc68a6a30e6ca1f23f435c0
+@manifest-body-hash    69299f1c380c78c3f1085e3cac281277e20a6e960985c72d798867af51a81848
 
 # -----------------------------------------------------------------------------
 # Author signature slot (ML-DSA-65 over @manifest-body-hash under author_pk).

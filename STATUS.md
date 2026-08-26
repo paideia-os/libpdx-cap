@@ -1,9 +1,20 @@
 # libpdx-cap — status
 
 **Wave:** R49 shared library
-**Current milestone:** M5 (1.0 signed release + .pdxdoc + mirror push) — CLOSED.
-**Released:** 1.0.0 (2026-08-22).
-All planned milestones (M1..M5) closed; library is consumer-ready.
+**Current milestone:** Enhancement v1.x — libpdx-cap (ENH-001..009) —
+CLOSED except ENH-008 (#18, deferred pending a confirmed `shell`
+fan-out need).
+**Released:** 1.0.1 (2026-08-25). **1.0.0 is WITHDRAWN** — that tag's
+tree does not assemble (missing `;` at `src/cap.pdx:214`, fixed three
+commits later). See `CHANGELOG.md`'s 1.0.1 entry for the full fix list:
+signed-jge slot-bound fail-open (#13), unwired CAP_BAD_KIND (#17),
+unreachable SIGNED_INODE_SIG_ABSENT (#12), a permuted CHANGELOG
+return-code table (#11), a `caps_decl_parse` item-drop bug found while
+landing the first-ever runnable test harness (#15), new CAP_BAD_SLOT
+test coverage (#14), and `doc/INTEGRATION.md` (#16).
+All planned milestones (M1..M5) remain closed; library is
+consumer-ready. Public surface and return-code vocabulary are
+unchanged from 1.0 — 1.0.1 is fixes + release hygiene, not a new API.
 
 ## Milestone rollup
 
@@ -145,14 +156,17 @@ milestone breakdown (M1–M5) and cross-repo dependencies.
   (authoritative distribution; `pkgs.paideia-os` mirror push
   deferred pending T-INFRA-001).
 
-## Consumer wiring (after M5)
+## Consumer wiring (after 1.0.1 / ENH-001)
 
-libpdx-cap is now 1.0-frozen. Consumers pin `libpdx-cap = 1.0.0`
-in their `deps.list` and consume the artifact set enumerated in
-`manifest.pdxsig`. The `@manifest-body-hash` in that file is
-`c222bca34f44e39b9ed4902e18fcc22683c4c9ae2fc68a6a30e6ca1f23f435c0`;
+libpdx-cap's public surface stays 1.0-frozen; consumers pin
+`libpdx-cap = 1.0.1` (or `^1.0`, which now resolves past the withdrawn
+`v1.0.0` tag) in their `deps.list` and consume the artifact set — now
+14 entries, `doc/INTEGRATION.md` and `tests/harness.pdx` added —
+enumerated in `manifest.pdxsig`. The `@manifest-body-hash` in that
+file is
+`69299f1c380c78c3f1085e3cac281277e20a6e960985c72d798867af51a81848`;
 downstream verifiers re-derive it via
-`sed -n '39,/^@end-artifacts$/p' manifest.pdxsig | sha256sum`
+`sed -n '54,/^@end-artifacts$/p' manifest.pdxsig | sha256sum`
 until `pkg verify` lands.
 
 ## Consumer wiring (after M3)

@@ -6,16 +6,84 @@ each entry maps 1:1 to a GitHub milestone in this repo (see
 `design/tooling/r49-r50-plan.md` §5.10 in the
 [paideia-os](https://github.com/paideia-os/paideia-os) repo).
 
-## Unreleased
+## 1.0.1 — 2026-08-25
 
-Rolling notes for the Enhancement v1.x milestone (ENH-001..009);
-folded into a dated `1.0.1` entry by ENH-001 once the milestone
-closes.
+**Milestone:** Enhancement v1.x — libpdx-cap (ENH-001..009).
+**Release manifest:** `manifest.pdxsig` (format v0.1; hash tree +
+`@manifest-body-hash` regenerated against this tree).
 
-- `doc/INTEGRATION.md` (ENH-007) — exec-time wiring guide + the
-  `ls`-owner-column M1→M3 migration table, now that
-  `kind_user_ref_decode` (M3-001) has shipped and nothing had told
-  `ls` to move onto it.
+**The `v1.0.0` tag is WITHDRAWN.** It points at `27c29e2`, a tree
+that does not assemble (`src/cap.pdx:214` was missing a `;` before a
+fall-through label; fixed three commits later at `da38a9e`, which
+`v1.0.0` predates). `v1.0.1` is cut from a tree that has actually been
+assembled with `paideia-as check` on every module and test file, and
+whose M4 witnesses have actually been run and returned `0` — the
+first time either has been true for a tagged release. Consumers
+pinning `libpdx-cap @ ^1.0` pick up the fix automatically.
+
+### Fixes
+
+- **ENH-004 (#13):** `cap_pack` / `cap_pack_narrowed`'s slot bound used
+  a signed `jge`; `slot >= 2^63` read as negative and fell through to
+  a truncating store instead of `CAP_BAD_SLOT`. Now unsigned `jae`.
+- **ENH-009 (#17):** `CAP_BAD_KIND` was declared and never returned —
+  `cap_pack` / `cap_pack_narrowed` silently truncated an out-of-range
+  `kind` (e.g. `0x10190`) to a well-formed but wrong `KIND_*`. Both
+  now reject `kind >= 0x10000` before any store. The
+  `KIND_TRANSFERABLE_TABLE` membership check remains a separate,
+  still-open item (needs a paideia-os `cap/kind.pdx` mirror decision).
+- **ENH-003 (#12):** `SIGNED_INODE_SIG_ABSENT` was declared
+  (`0xFFFFFFF1`) but `signed_inode_has_signature`'s absent path
+  returned literal `0`. Resolved as reserved-unused rather than
+  redefining a frozen 1.0 return value; source, design doc, this
+  CHANGELOG, and README now agree the real contract is `1` / `0` /
+  `SIGNED_INODE_BAD_INODE`.
+- **`caps_decl_parse` item-drop bug (found while landing ENH-006):**
+  NUL-terminating a list item's `'\n'` boundary in place destroyed
+  the sentinel the post-item scan needed to find the line's end, so
+  the scan walked into the NEXT line and silently swallowed it —
+  every OTHER item in any `requires:` / `declares_output_schemas:`
+  section with 2+ plain-newline-terminated items was dropped without
+  error. This means every 1.0.0 consumer with 2+ requires items in its
+  `caps.decl` (the plan doc's own worked example — `pkg install` with
+  6 requires items — would have retained only 3) was silently
+  under-declaring. Fixed with a per-item dispatch flag (`r14`) so the
+  parser only re-scans when the boundary genuinely has more line
+  content ahead of it.
+
+### Corrections (documentation / release hygiene)
+
+- **ENH-002 (#11):** `CHANGELOG.md`'s 1.0.0 return-code table had five
+  `CAPS_DECL_*` codes permuted against `src/caps_decl.pdx`; corrected.
+  Entry-point count corrected 12 → 20 (grep-verified).
+- **ENH-007 (#16):** added `doc/INTEGRATION.md` — a copy-pasteable
+  exec-time wiring sequence, `ls`'s owner column cited as the one
+  verified production integration, and the M1→M3 migration recipe for
+  `ls`'s still-unmigrated M2-era shim. `design/architecture.md` §1 no
+  longer reads as if the exec-time flow is universally wired — it
+  isn't, yet, anywhere.
+
+### Added
+
+- **ENH-005 (#14):** 8 new `m4_002_caps_decl_matrix` stages (S23..S30)
+  covering `CAP_BAD_SLOT` — `cap_pack`'s only failure mode had zero
+  test coverage before this. Every rejecting stage also asserts `dst`
+  is left byte-for-byte untouched.
+- **ENH-006 (#15):** `tests/harness.pdx` + `tools/run-tests.sh` — links
+  every `src/*.pdx` module and both M4 witnesses into one hosted ELF64
+  executable and actually runs it. This is what caught the
+  `caps_decl_parse` bug above; before this, the "10^6 LCG-driven
+  iterations" claim in the 1.0.0 entry below had executed zero
+  iterations.
+
+### Deferred
+
+- **ENH-008 (#18)** — additive caller-owned (re-entrant) `Cap`/`CapsDecl`
+  context variants for fan-out consumers. Left open per the issue's
+  own recommendation: `shell` is the natural design partner and the
+  context layout should be settled against its real fan-out path
+  rather than in the abstract; no consumer has yet confirmed the need
+  in practice.
 
 ## 1.0.0 — 2026-08-22
 

@@ -243,9 +243,14 @@ now that `kind_user_ref_decode` has shipped.
 
 ## Version
 
-**v1.0.0**, tagged 2026-08-22 — milestones M1–M5 closed, public surface
-and return-code vocabulary frozen. See [`CHANGELOG.md`](CHANGELOG.md)
-for the milestone roll-up, the test contract, and the dual-signature
+**v1.0.1**, tagged 2026-08-25 — `v1.0.0` is WITHDRAWN (that tag's tree
+does not assemble; see `CHANGELOG.md`). `v1.0.1` is the first tag cut
+from a tree that has actually been assembled and whose M4 witnesses
+have actually run and returned `0` (`bash tools/run-tests.sh`).
+Milestones M1–M5 remain closed; public surface and return-code
+vocabulary remain frozen — 1.0.1 is fixes + release hygiene, not a
+new API. See [`CHANGELOG.md`](CHANGELOG.md) for the milestone
+roll-up, the fix list, the test contract, and the dual-signature
 status (the two ML-DSA-65 slots in `manifest.pdxsig` are reserved
 placeholders pending signing-bot infrastructure).
 `design/architecture.md` is the internal spec; `STATUS.md` carries
