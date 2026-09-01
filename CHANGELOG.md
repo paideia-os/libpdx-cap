@@ -6,6 +6,64 @@ each entry maps 1:1 to a GitHub milestone in this repo (see
 `design/tooling/r49-r50-plan.md` §5.10 in the
 [paideia-os](https://github.com/paideia-os/paideia-os) repo).
 
+## Unreleased
+
+**Milestone:** Enhancement v1.x — libpdx-cap. Follow-up to 1.0.1;
+no version tag cut yet (see "Release-manifest note" below).
+
+### Added
+
+- **ENH-008 (#18):** additive caller-owned (re-entrant) context
+  variants for fan-out consumers. New sixth module `CapCtx`
+  (`src/cap_ctx.pdx`) ships five entry points alongside the M1
+  singletons — the M1 API is unchanged and no existing consumer
+  (`ls`) needs to move:
+  - `cap_ctx_reset(ctx)` / `caps_decl_ctx_reset(ctx)` — zero the
+    caller's context to a known-empty state (mirror of
+    `Cap::cap_reset` / `CapsDecl::caps_decl_reset`).
+  - `cap_unpack_into(ctx, src)` — writes the four unpacked lanes
+    into the caller's 32-byte Cap context instead of the singleton.
+  - `cap_unpack_checked_into(ctx, src, decl_ctx)` — same gate as
+    `cap_unpack_checked`, but against a caller-owned CapsDecl
+    context; on reject leaves the caller's cap ctx untouched
+    (fail-fast, mirrored).
+  - `caps_decl_parse_into(ctx, src, len)` — the M1 parser reworked
+    to read/write from a caller-owned 416-byte CapsDecl context.
+    Bit-identical grammar and state machine to `caps_decl_parse`
+    (including the libpdx-cap#15 item-tail-dispatch-flag fix).
+  - `cap_manifest_verify_into(decl_ctx, received_ptr, received_count)`
+    — finally does what `cap_manifest_verify`'s reserved `decl_ptr`
+    parameter documented at 1.0: reads `req_count` / `req_kind_names`
+    from the caller's decl ctx. The 1.0 `cap_manifest_verify` entry
+    keeps its behaviour (its `decl_ptr` remains informational).
+
+  Context layouts are published as constants (`CAP_CTX_SIZE = 32`,
+  `CAPS_DECL_CTX_SIZE = 416`, plus per-field `_OFF` constants) so a
+  caller sizes its own buffer without a header —
+  same discipline `SignedInode` uses for its inode-layout constants.
+  Layouts are byte-identical to the singleton field shapes so a
+  consumer that already reads the singletons can port by swapping
+  `lea r11, [rip + <field>]` for `lea r11, [<ctx_reg> + <offset>]`.
+
+  M4-002 gains a 10-stage sub-corpus (S31..S40) proving two live
+  Cap contexts and two live CapsDecl contexts coexist in one
+  process. Fingerprint stages: S33 (interleaved decl ctxs read
+  back correct req_counts), S36 (interleaved cap ctxs read back
+  correct kind/slot values), S40 (same received wire yields
+  different `cap_manifest_verify_into` results under two different
+  decl ctxs — the shape ENH-008 exists to enable).
+
+  Return-code vocabulary unchanged; no new sentinels introduced.
+
+### Release-manifest note
+
+The 1.0.1 `manifest.pdxsig` hash tree does not yet cover
+`src/cap_ctx.pdx` or the new `_m4mx_*_e8` fixture and S31..S40
+stages in `tests/m4_002_caps_decl_matrix.pdx`. A follow-up issue
+should cut 1.0.2 after `shell` (the natural design partner for
+ENH-008 per its issue body) validates the context layout against
+its real fan-out path and confirms no further shape adjustments.
+
 ## 1.0.1 — 2026-08-25
 
 **Milestone:** Enhancement v1.x — libpdx-cap (ENH-001..009).
@@ -83,7 +141,8 @@ pinning `libpdx-cap @ ^1.0` pick up the fix automatically.
   own recommendation: `shell` is the natural design partner and the
   context layout should be settled against its real fan-out path
   rather than in the abstract; no consumer has yet confirmed the need
-  in practice.
+  in practice. *(Superseded: shipped in the Unreleased section above;
+  see ENH-008 (#18) entry there.)*
 
 ## 1.0.0 — 2026-08-22
 

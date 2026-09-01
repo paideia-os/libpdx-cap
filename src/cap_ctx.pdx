@@ -1,0 +1,917 @@
+// src/cap_ctx.pdx — libpdx-cap.ENH-008
+// CapCtx module: caller-owned (re-entrant) variants of the M1 singleton
+// entry points, added additively so fan-out consumers (`shell` → N
+// children in parallel) can carry multiple live Cap unpacks and
+// multiple parsed CapsDecl records inside one process.
+//
+// Design context
+// --------------
+// design/architecture.md §3 (and the 1.0 CHANGELOG's Deferred note for
+// ENH-008) both call out the singleton storage model's cost: "one
+// cap_unpack at a time", "one caps_decl_parse per process". The 1.0
+// API's `cap_manifest_verify` signature accepts a `decl_ptr` that is
+// documented as "informational; reserved for the M4 caller-owned
+// variant" (src/cap.pdx:522, :527) — the planned extension point
+// vestige.
+//
+// This module ships that extension as PURE ADDITIONS: every 1.0 entry
+// point in Cap and CapsDecl is UNTOUCHED (ls, which uses the M1 API,
+// needs no change), and every `_into` variant lives here so callers
+// who need re-entrancy import CapCtx explicitly. Consumers who hold
+// several caps live at once, or reconcile more than one caps.decl
+// (subshell, `mux` split, `shell`'s fan-out over N children) allocate
+// their own byte buffers of the sizes published below.
+//
+// Context layouts (published as constants; caller sizes its own buffer)
+// -----------------
+// Cap context (32 bytes, 8-byte alignment) — matches the Cap module's
+// four `unpacked_*` singleton slots one-for-one:
+//   +0   u64  slot          (matches Cap::unpacked_slot)
+//   +8   u64  kind          (matches Cap::unpacked_kind)
+//   +16  u64  rights        (matches Cap::unpacked_rights)
+//   +24  u64  target_ptr    (matches Cap::unpacked_target_ptr)
+//
+// CapsDecl context (416 bytes, 8-byte alignment) — matches the CapsDecl
+// module's singleton record field-for-field:
+//   +0    [u64;16] req_kind_names    (128 B) (matches CapsDecl::req_kind_names)
+//   +128  [u64;16] req_args_texts    (128 B) (matches CapsDecl::req_args_texts)
+//   +256  u64      req_count         (  8 B) (matches CapsDecl::req_count)
+//   +264  [u64;16] schema_names      (128 B) (matches CapsDecl::schema_names)
+//   +392  u64      schema_count      (  8 B) (matches CapsDecl::schema_count)
+//   +400  u64      error_code        (  8 B) (matches CapsDecl::error_code)
+//   +408  u64      error_line_index  (  8 B) (matches CapsDecl::error_line_index)
+//
+// The layouts are BYTE-IDENTICAL to the existing singleton field shapes
+// so a consumer that already reads from the singletons can port to
+// CapCtx by swapping `lea r11, [rip + <field>]` for
+// `lea r11, [<ctx_reg> + <offset>]`. Callers publish their buffer as
+// `pub let mut my_cap_ctx : [u8; 32] = uninit @align(8)` and
+// `pub let mut my_decl_ctx : [u8; 416] = uninit @align(8)`.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module name PascalCase basename (`CapCtx`), no directory prefix.
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses immediate ≤ 0x7FFFFFFF; every
+//     0xFFFFFF-family sentinel is loaded via `mov rax, imm32` return
+//     store (never as a compare imm). The largest compare-imm in this
+//     module is 0xFFFF (the kind-lane mask).
+//   - `r11` reserved as LEA scratch (into caller-supplied buffers,
+//     rather than into .bss).
+//   - Byte reads via `xor rax, rax; mov_b rax, [ptr]` (#1248 mitigation)
+//     — used in the parser body.
+//   - Callee-save discipline documented per function below.
+
+module CapCtx = structure {
+
+  // ============================================================================
+  // Layout constants — published so a caller can size the buffer without
+  // relying on this header. Same precedent as SignedInode publishing
+  // INODE_HEAD_BYTES / SIG_PRESENT_OFFSET / etc.
+  // ============================================================================
+
+  // Cap context — 32 bytes, mirrors the four unpacked_* slots.
+  pub let CAP_CTX_SIZE                       : u64 = 32
+  pub let CAP_CTX_ALIGN                      : u64 = 8
+  pub let CAP_CTX_SLOT_OFF                   : u64 = 0
+  pub let CAP_CTX_KIND_OFF                   : u64 = 8
+  pub let CAP_CTX_RIGHTS_OFF                 : u64 = 16
+  pub let CAP_CTX_TARGET_PTR_OFF             : u64 = 24
+
+  // CapsDecl context — 416 bytes, mirrors the CapsDecl singleton.
+  pub let CAPS_DECL_CTX_SIZE                 : u64 = 416
+  pub let CAPS_DECL_CTX_ALIGN                : u64 = 8
+  pub let CAPS_DECL_CTX_REQ_KIND_NAMES_OFF   : u64 = 0
+  pub let CAPS_DECL_CTX_REQ_ARGS_TEXTS_OFF   : u64 = 128
+  pub let CAPS_DECL_CTX_REQ_COUNT_OFF        : u64 = 256
+  pub let CAPS_DECL_CTX_SCHEMA_NAMES_OFF     : u64 = 264
+  pub let CAPS_DECL_CTX_SCHEMA_COUNT_OFF     : u64 = 392
+  pub let CAPS_DECL_CTX_ERROR_CODE_OFF       : u64 = 400
+  pub let CAPS_DECL_CTX_ERROR_LINE_INDEX_OFF : u64 = 408
+
+  // ============================================================================
+  // cap_ctx_reset(ctx)
+  //
+  // Signature: cap_ctx_reset : (u64) -> () !{mem} @{}
+  // RDI (input): ctx — VA of a 32-byte Cap context (caller-owned,
+  //                    8-byte aligned).
+  //
+  // Zero the four Cap-context slots so a subsequent cap_unpack_into
+  // starts from a known-empty context. Mirrors Cap::cap_reset()'s
+  // discipline: a botched _into that leaves a stale value in place is
+  // caught rather than masked.
+  //
+  // Leaf; r11 scratch; no push/pop parity to preserve.
+  // ============================================================================
+  pub let cap_ctx_reset : (u64) -> () !{mem} @{} =
+    fn (ctx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-cap.ENH-008 cap_ctx_reset. Mirror of Cap::cap_reset() for the caller-owned 32-byte Cap context. xor rax,rax produces the zero constant; four qword stores clear the four ctx slots at their published offsets (0/8/16/24). Direct base+disp addressing rather than lea+mov because the ctx pointer is already in rdi and there are no intervening loads that would clobber it. r11 unused (no .bss touch — this module never owns .bss for context state). Leaf function; no callee-save touched; no push/pop parity to preserve.",
+      block: {
+        xor rax, rax;
+        mov [rdi + 0],  rax;                // CAP_CTX_SLOT_OFF
+        mov [rdi + 8],  rax;                // CAP_CTX_KIND_OFF
+        mov [rdi + 16], rax;                // CAP_CTX_RIGHTS_OFF
+        mov [rdi + 24], rax;                // CAP_CTX_TARGET_PTR_OFF
+        ret
+      }
+    }
+
+  // ============================================================================
+  // caps_decl_ctx_reset(ctx)
+  //
+  // Signature: caps_decl_ctx_reset : (u64) -> () !{mem} @{}
+  // RDI (input): ctx — VA of a 416-byte CapsDecl context (caller-owned,
+  //                    8-byte aligned).
+  //
+  // Zero the four counters + the two diagnostic slots so a subsequent
+  // caps_decl_parse_into starts from a known-empty CapsDecl context.
+  // Mirrors CapsDecl::caps_decl_reset()'s discipline: the pointer arrays
+  // (req_kind_names / req_args_texts / schema_names) are index-consumed
+  // up to their counters, so stale trailing entries are unreachable and
+  // do not need zeroing — same idiom the singleton reset uses.
+  //
+  // Leaf; r11 scratch; no push/pop parity to preserve.
+  // ============================================================================
+  pub let caps_decl_ctx_reset : (u64) -> () !{mem} @{} =
+    fn (ctx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-cap.ENH-008 caps_decl_ctx_reset. Mirror of CapsDecl::caps_decl_reset() for the caller-owned 416-byte CapsDecl context. xor rax,rax; four qword stores at the four counter offsets (256=req_count, 392=schema_count, 400=error_code, 408=error_line_index). The three pointer arrays are index-consumed against their counters, matching the singleton reset's precedent — a zeroed counter makes stale trailing pointers unreachable, so a zero-body pass over the 384 pointer bytes is unnecessary. r11 unused (this module never owns .bss for context state). Leaf function; no callee-save touched.",
+      block: {
+        xor rax, rax;
+        mov [rdi + 256], rax;               // CAPS_DECL_CTX_REQ_COUNT_OFF
+        mov [rdi + 392], rax;               // CAPS_DECL_CTX_SCHEMA_COUNT_OFF
+        mov [rdi + 400], rax;               // CAPS_DECL_CTX_ERROR_CODE_OFF
+        mov [rdi + 408], rax;               // CAPS_DECL_CTX_ERROR_LINE_INDEX_OFF
+        ret
+      }
+    }
+
+  // ============================================================================
+  // cap_unpack_into(ctx, src) -> rc
+  //
+  // Signature: cap_unpack_into : (u64, u64) -> u64 !{mem} @{}
+  // RDI (input): ctx — VA of a 32-byte Cap context (caller-owned,
+  //                    8-byte aligned).
+  // RSI (input): src — VA of a 16-byte Cap wire record (8-byte aligned).
+  // RAX (output): CAP_OK (this variant, like cap_unpack, never fails —
+  //               the kind-set gate lives in cap_unpack_checked_into).
+  //
+  // Reads the two wire qwords and splits qword0 into the three narrow
+  // lanes:
+  //   ctx[+0]  = qword0 & 0xFFFF               (slot)
+  //   ctx[+8]  = (qword0 >> 16) & 0xFFFF       (kind)
+  //   ctx[+16] = qword0 >> 32                  (rights; shr zero-extends)
+  //   ctx[+24] = qword1                        (target_ptr)
+  //
+  // Identical bit-manipulation shape to Cap::cap_unpack (src/cap.pdx
+  // §357), differing only in the store destinations — the caller's
+  // context, not the .bss singleton.
+  //
+  // Register plan (leaf, all caller-save):
+  //   rax = qword0 accumulator
+  //   r9  = extracted lane value (survives no calls; caller-save)
+  //   r10 = mask constant (0xFFFF)
+  //   rdi = ctx (untouched)
+  //   rsi = src (untouched)
+  //   r11 = unused (no .bss LEA needed — destinations use rdi + disp)
+  // ============================================================================
+  pub let cap_unpack_into : (u64, u64) -> u64 !{mem} @{} =
+    fn (ctx: u64) (src: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-cap.ENH-008 cap_unpack_into. Caller-owned variant of Cap::cap_unpack. Identical two-qword wire-load + shift-and-mask lane extraction (src/cap.pdx line 357), differing only in that the four lane stores land at [rdi + <ctx_off>] instead of [rip + unpacked_*]. Rights lane needs no mask because shr rax,32 naturally zero-extends the high 32 bits away — same reasoning as cap_unpack. r11 is unused here (the singleton version needed it to LEA into .bss; the _into version's destinations are already reachable as base+disp off rdi). Leaf function; no push/pop parity to preserve. Round-trip guarantee: values written by cap_pack are recovered here byte-for-byte across all four fields, same as cap_unpack (M4-001 covers the singleton path; the M4-002 stages added at this issue exercise the _into path against the same wire records the singleton path handles).",
+      block: {
+        // Load qword0. Every lane derives from it via mov+shift+mask.
+        mov rax, [rsi + 0];
+
+        // Slot lane: rax & 0xFFFF -> ctx[+0].
+        mov r10, 0xFFFF;
+        mov r9, rax;
+        and r9, r10;
+        mov [rdi + 0], r9;
+
+        // Kind lane: (rax >> 16) & 0xFFFF -> ctx[+8].
+        mov r9, rax;
+        shr r9, 16;
+        and r9, r10;
+        mov [rdi + 8], r9;
+
+        // Rights lane: rax >> 32 -> ctx[+16]. shr zero-extends → no mask.
+        mov r9, rax;
+        shr r9, 32;
+        mov [rdi + 16], r9;
+
+        // Target_ptr lane: [rsi + 8] verbatim -> ctx[+24].
+        mov r9, [rsi + 8];
+        mov [rdi + 24], r9;
+
+        xor rax, rax;                       // CAP_OK
+        ret
+      }
+    }
+
+  // ============================================================================
+  // cap_unpack_checked_into(ctx, src, decl_ctx) -> rc
+  //
+  // Signature: cap_unpack_checked_into : (u64, u64, u64) -> u64 !{mem} @{}
+  // RDI (input): ctx      — VA of a 32-byte Cap context (caller-owned).
+  // RSI (input): src      — VA of a 16-byte Cap wire record.
+  // RDX (input): decl_ctx — VA of a 416-byte CapsDecl context that has
+  //                          already been populated by
+  //                          caps_decl_parse_into.
+  // RAX (output): CAP_OK | CAP_MANIFEST_EXTRA
+  //   (CAP_KIND_UNKNOWN is intentionally NOT surfaced here — the loud
+  //    detection lives at cap_manifest_verify_into's Pass 1, same
+  //    reasoning as Cap::cap_unpack_checked's docstring.)
+  //
+  // Caller-owned variant of Cap::cap_unpack_checked. Extracts the recv
+  // kind from the wire record, walks the decl_ctx's req_kind_names[]
+  // (against decl_ctx[+256] = req_count), resolves each name via
+  // KindNames::kind_names_resolve, and only on a match writes the four
+  // lanes to the caller's ctx. On miss (kind not declared), the four
+  // ctx slots are LEFT UNTOUCHED (fail-fast; mirrors cap_pack's
+  // discipline of leaving dst untouched on bad-slot).
+  //
+  // Register plan (non-leaf; calls kind_names_resolve):
+  //   r12 = decl scan index j                         [callee-save]
+  //   r13 = extracted recv kind (survives nested calls) [callee-save]
+  //   r14 = src ptr save (survives nested calls)      [callee-save]
+  //   r15 = ctx ptr save (survives nested calls)      [callee-save]
+  //   rbx = decl_ctx save (survives nested calls)     [callee-save]
+  //   rax = kind_names_resolve result / return code
+  //   r11 = LEA scratch for decl_ctx base+off computations
+  //
+  // rsp alignment: 5 callee-save pushes (r12/r13/r14/r15/rbx). Entry
+  // rsp % 16 == 8; after 5 pushes (-40 bytes) rsp % 16 == 0. Aligned
+  // at every nested-call site.
+  // ============================================================================
+  pub let cap_unpack_checked_into : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (ctx: u64) (src: u64) (decl_ctx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-cap.ENH-008 cap_unpack_checked_into. Caller-owned variant of Cap::cap_unpack_checked (src/cap.pdx line 437). Guarded receive-site unpack against a caller-owned CapsDecl context: extracts the kind lane from the wire record, verifies it is named by the parsed CapsDecl at decl_ctx (reads req_count from decl_ctx[+256] and req_kind_names[j] from decl_ctx[+j*8]), and only then writes the four lanes to the caller's Cap context at rdi. If the kind is not in the decl, the unpack is refused with CAP_MANIFEST_EXTRA and the four ctx slots are left untouched (fail-fast; mirrors both cap_pack's dst-untouched-on-reject and the singleton cap_unpack_checked's unpacked_*-untouched-on-reject discipline). Kind lane extraction reuses the shift-and-mask idiom from cap_unpack_into above. As in the singleton version, a decl name that resolves to KIND_NAMES_UNKNOWN simply fails to match at the inner compare — that loud detection lives at cap_manifest_verify_into's Pass 1, not here. paideia-as conformance: r11 is LEA scratch (into decl_ctx, not .bss); every cmp reg,imm uses imm ≤ 0x7FFFFFFF (largest is 0xFFFF for the kind mask); no `test` mnemonic; no byte reads (all wire and ctx loads are qwords). Non-leaf: five callee-save pushes (r12/r13/r14/r15/rbx) → rsp % 16 == 0 at every nested-call site (entry 8; five pushes flip to 0).",
+      block: {
+        // ---- prologue ------------------------------------------------------
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        push rbx;
+
+        mov r14, rsi;                   // r14 = src (save across nested calls)
+        mov r15, rdi;                   // r15 = ctx (save across nested calls)
+        mov rbx, rdx;                   // rbx = decl_ctx (save)
+
+        // Extract recv kind = (src[0..7] >> 16) & 0xFFFF.
+        mov rax, [rsi + 0];
+        shr rax, 16;
+        and rax, 0xFFFF;
+        mov r13, rax;                   // r13 = recv kind
+
+        // Scan decl_ctx.req_kind_names[0..req_count] for a matching name.
+        xor r12, r12;                   // j = 0
+
+      _cuci_scan_head:
+        // req_count at decl_ctx[+256].
+        mov rax, [rbx + 256];
+        cmp r12, rax;
+        jge _cuci_extra;
+
+        // req_kind_names base at decl_ctx[+0]; entry j at [base + j*8].
+        lea r11, [rbx + 0];             // CAPS_DECL_CTX_REQ_KIND_NAMES_OFF
+        mov rdi, [r11 + r12*8];
+
+        call kind_names_resolve;
+
+        cmp rax, r13;
+        je _cuci_hit;
+
+        add r12, 1;
+        jmp _cuci_scan_head;
+
+      _cuci_hit:
+        // Kind is declared. Perform the four-lane unpack into the
+        // caller's ctx (r15). Same store shape as cap_unpack_into.
+        mov rax, [r14 + 0];             // qword0
+
+        mov r10, 0xFFFF;
+
+        mov r9, rax;
+        and r9, r10;
+        mov [r15 + 0], r9;              // slot
+
+        mov r9, rax;
+        shr r9, 16;
+        and r9, r10;
+        mov [r15 + 8], r9;              // kind
+
+        mov r9, rax;
+        shr r9, 32;
+        mov [r15 + 16], r9;             // rights
+
+        mov r9, [r14 + 8];
+        mov [r15 + 24], r9;             // target_ptr
+
+        xor rax, rax;                   // CAP_OK
+        pop rbx;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      _cuci_extra:
+        // Kind not declared. Leave the four ctx slots untouched.
+        mov rax, 0xFFFFFFFB;            // CAP_MANIFEST_EXTRA
+        pop rbx;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // caps_decl_parse_into(ctx, src, src_len) -> rc
+  //
+  // Signature: caps_decl_parse_into : (u64, u64, u64) -> u64 !{mem} @{}
+  // RDI (input): ctx     — VA of a 416-byte CapsDecl context
+  //                        (caller-owned, 8-byte aligned).
+  // RSI (input): src     — VA of the caps.decl text (NUL not required).
+  // RDX (input): src_len — number of bytes.
+  // RAX (output): CAPS_DECL_OK or one of the CAPS_DECL_* error codes
+  //               (same vocabulary as CapsDecl::caps_decl_parse).
+  //
+  // Caller-owned variant of CapsDecl::caps_decl_parse. Bit-identical
+  // grammar and state machine (design/architecture.md §4); the only
+  // difference is that every read/write of parser state lands at
+  // [ctx + <off>] instead of [rip + <singleton_field>]. In-place
+  // NUL-termination of list items in the caller's source buffer is
+  // preserved (same idiom as the singleton parser and as
+  // tokenizer.pdx / libpdx-argv parser.pdx).
+  //
+  // Register plan (leaf; no nested calls — the parser is self-contained):
+  //   r8  = cursor (running byte pointer into src)
+  //   r9  = end   (src + src_len; loaded once, never mutated)
+  //   r10 = state (STATE_TOP/REQ/SCH)
+  //   r11 = scratch (LEA target for every ctx store; masking scratch)
+  //   r12 = line_index (0-based; incremented at end of each line) [callee-save]
+  //   r13 = walk cursor within current line / item-boundary pointer [callee-save]
+  //   r14 = item-tail dispatch flag (see #15 fix in caps_decl.pdx)  [callee-save]
+  //   r15 = ctx (save across the whole parse)                       [callee-save]
+  //   rax = byte load / return value scratch
+  //   rcx = generic working cursor / count
+  //   rdx = current-line pointer (line_start; ident recording)
+  //
+  // Four callee-save pushes (r12/r13/r14/r15) with matched pops on
+  // both exit paths. Function makes NO nested calls, so alignment at
+  // call site is not an obligation; only push/pop parity matters.
+  //
+  // Note on rdx: original singleton parser also uses rdx as the "ident
+  // start pointer" inside the item-record path. In the _into version
+  // we consume the src_len input at prologue (`add r9, rdx`) BEFORE
+  // any use of rdx as the ident-start scratch, so the two roles do
+  // not collide.
+  // ============================================================================
+  pub let caps_decl_parse_into : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (ctx: u64) (src: u64) (src_len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-cap.ENH-008 caps_decl_parse_into. Caller-owned variant of CapsDecl::caps_decl_parse (src/caps_decl.pdx line 171). Bit-identical grammar / state machine / boundary dispatch to the singleton parser — including the libpdx-cap#15 item-tail-dispatch-flag fix (r14 = 0 → scan for real '\\n' still ahead; r14 = 1 → r13 IS the consumed EOL, step past directly). The only structural difference is that every read/write of parser state lands at [r15 + <off>] instead of [rip + <singleton_field>]: req_count at r15+256, req_kind_names at r15+0, req_args_texts at r15+128, schema_count at r15+392, schema_names at r15+264, error_code at r15+400, error_line_index at r15+408 (per the layout constants published at the top of this module). The prologue consumes rdx (src_len input) BEFORE any use of rdx as the ident-start scratch, so the singleton's rdx dual-role is preserved without collision. Four callee-save pushes (r12/r13/r14/r15) with matched pops at both exits. Function makes NO nested calls, so alignment at call site is not an obligation; push/pop parity is preserved. paideia-as conformance: xor rax,rax; mov_b before every byte compare (#1248 mitigation, exhaustive); every cmp reg,imm uses imm ≤ 0x7FFFFFFF; r11 reserved as LEA scratch (into the caller's ctx, not .bss); no `test` mnemonic.",
+      block: {
+        // ---- prologue -------------------------------------------------------
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov r15, rdi;                   // r15 = ctx (save for the whole parse)
+        mov r8, rsi;                    // r8 = cursor = src
+        mov r9, rsi;
+        add r9, rdx;                    // r9 = end = src + src_len (rdx now free)
+        xor r10, r10;                   // r10 = state = STATE_TOP (0)
+        xor r12, r12;                   // r12 = line_index = 0
+        xor r14, r14;                   // r14 = item-tail dispatch flag (defensive)
+
+      // ==== per-line loop head =============================================
+      _cdpi_line_head:
+        cmp r8, r9;
+        jge _cdpi_parse_done_ok;
+
+        // ---- skip leading spaces/tabs ---------------------------------------
+      _cdpi_skip_leading_ws:
+        cmp r8, r9;
+        jge _cdpi_line_advance_newline_or_end;
+        xor rax, rax;
+        mov_b rax, [r8];
+        cmp rax, 0x20;                  // ' '
+        je _cdpi_bump_leading_ws;
+        cmp rax, 0x09;                  // '\t'
+        je _cdpi_bump_leading_ws;
+        jmp _cdpi_classify_first;
+
+      _cdpi_bump_leading_ws:
+        add r8, 1;
+        jmp _cdpi_skip_leading_ws;
+
+        // ---- classify first non-ws byte -------------------------------------
+      _cdpi_classify_first:
+        cmp rax, 0x0A;                  // '\n' → empty line
+        je _cdpi_line_consume_nl;
+        cmp rax, 0x23;                  // '#' → comment
+        je _cdpi_line_skip_to_nl;
+        cmp rax, 0x2D;                  // '-' → list item
+        je _cdpi_try_list_item;
+        cmp rax, 0x72;                  // 'r' → try "requires:"
+        je _cdpi_try_requires;
+        cmp rax, 0x64;                  // 'd' → try "declares_output_schemas:"
+        je _cdpi_try_declares;
+        mov rax, 0xFFFFFFF8;            // CAPS_DECL_MALFORMED_HEADER
+        jmp _cdpi_parse_fail;
+
+      // ==== "requires:" ====================================================
+      _cdpi_try_requires:
+        xor rax, rax; mov_b rax, [r8 + 1]; cmp rax, 0x65; jne _cdpi_hdr_bad;  // e
+        xor rax, rax; mov_b rax, [r8 + 2]; cmp rax, 0x71; jne _cdpi_hdr_bad;  // q
+        xor rax, rax; mov_b rax, [r8 + 3]; cmp rax, 0x75; jne _cdpi_hdr_bad;  // u
+        xor rax, rax; mov_b rax, [r8 + 4]; cmp rax, 0x69; jne _cdpi_hdr_bad;  // i
+        xor rax, rax; mov_b rax, [r8 + 5]; cmp rax, 0x72; jne _cdpi_hdr_bad;  // r
+        xor rax, rax; mov_b rax, [r8 + 6]; cmp rax, 0x65; jne _cdpi_hdr_bad;  // e
+        xor rax, rax; mov_b rax, [r8 + 7]; cmp rax, 0x73; jne _cdpi_hdr_bad;  // s
+        xor rax, rax; mov_b rax, [r8 + 8]; cmp rax, 0x3A; jne _cdpi_hdr_bad;  // ':'
+
+        add r8, 9;
+
+        mov r13, r8;
+      _cdpi_req_check_none:
+        cmp r13, r9;
+        jge _cdpi_req_open_section;
+        xor rax, rax;
+        mov_b rax, [r13];
+        cmp rax, 0x0A;
+        je _cdpi_req_open_section;
+        cmp rax, 0x20;
+        je _cdpi_req_bump_none;
+        cmp rax, 0x28;
+        je _cdpi_req_try_none;
+        mov rax, 0xFFFFFFF8;            // CAPS_DECL_MALFORMED_HEADER
+        jmp _cdpi_parse_fail;
+
+      _cdpi_req_bump_none:
+        add r13, 1;
+        jmp _cdpi_req_check_none;
+
+      _cdpi_req_try_none:
+        xor rax, rax; mov_b rax, [r13 + 1]; cmp rax, 0x6E; jne _cdpi_hdr_bad;  // n
+        xor rax, rax; mov_b rax, [r13 + 2]; cmp rax, 0x6F; jne _cdpi_hdr_bad;  // o
+        xor rax, rax; mov_b rax, [r13 + 3]; cmp rax, 0x6E; jne _cdpi_hdr_bad;  // n
+        xor rax, rax; mov_b rax, [r13 + 4]; cmp rax, 0x65; jne _cdpi_hdr_bad;  // e
+        xor rax, rax; mov_b rax, [r13 + 5]; cmp rax, 0x29; jne _cdpi_hdr_bad;  // ')'
+        xor r10, r10;                   // state = STATE_TOP (empty section)
+        add r13, 6;
+        mov r8, r13;
+        jmp _cdpi_line_skip_to_nl;
+
+      _cdpi_req_open_section:
+        mov r10, 1;                     // STATE_REQ
+        mov r8, r13;
+        jmp _cdpi_line_skip_to_nl;
+
+      // ==== "declares_output_schemas:" =====================================
+      _cdpi_try_declares:
+        xor rax, rax; mov_b rax, [r8 +  1]; cmp rax, 0x65; jne _cdpi_hdr_bad;  // e
+        xor rax, rax; mov_b rax, [r8 +  2]; cmp rax, 0x63; jne _cdpi_hdr_bad;  // c
+        xor rax, rax; mov_b rax, [r8 +  3]; cmp rax, 0x6C; jne _cdpi_hdr_bad;  // l
+        xor rax, rax; mov_b rax, [r8 +  4]; cmp rax, 0x61; jne _cdpi_hdr_bad;  // a
+        xor rax, rax; mov_b rax, [r8 +  5]; cmp rax, 0x72; jne _cdpi_hdr_bad;  // r
+        xor rax, rax; mov_b rax, [r8 +  6]; cmp rax, 0x65; jne _cdpi_hdr_bad;  // e
+        xor rax, rax; mov_b rax, [r8 +  7]; cmp rax, 0x73; jne _cdpi_hdr_bad;  // s
+        xor rax, rax; mov_b rax, [r8 +  8]; cmp rax, 0x5F; jne _cdpi_hdr_bad;  // _
+        xor rax, rax; mov_b rax, [r8 +  9]; cmp rax, 0x6F; jne _cdpi_hdr_bad;  // o
+        xor rax, rax; mov_b rax, [r8 + 10]; cmp rax, 0x75; jne _cdpi_hdr_bad;  // u
+        xor rax, rax; mov_b rax, [r8 + 11]; cmp rax, 0x74; jne _cdpi_hdr_bad;  // t
+        xor rax, rax; mov_b rax, [r8 + 12]; cmp rax, 0x70; jne _cdpi_hdr_bad;  // p
+        xor rax, rax; mov_b rax, [r8 + 13]; cmp rax, 0x75; jne _cdpi_hdr_bad;  // u
+        xor rax, rax; mov_b rax, [r8 + 14]; cmp rax, 0x74; jne _cdpi_hdr_bad;  // t
+        xor rax, rax; mov_b rax, [r8 + 15]; cmp rax, 0x5F; jne _cdpi_hdr_bad;  // _
+        xor rax, rax; mov_b rax, [r8 + 16]; cmp rax, 0x73; jne _cdpi_hdr_bad;  // s
+        xor rax, rax; mov_b rax, [r8 + 17]; cmp rax, 0x63; jne _cdpi_hdr_bad;  // c
+        xor rax, rax; mov_b rax, [r8 + 18]; cmp rax, 0x68; jne _cdpi_hdr_bad;  // h
+        xor rax, rax; mov_b rax, [r8 + 19]; cmp rax, 0x65; jne _cdpi_hdr_bad;  // e
+        xor rax, rax; mov_b rax, [r8 + 20]; cmp rax, 0x6D; jne _cdpi_hdr_bad;  // m
+        xor rax, rax; mov_b rax, [r8 + 21]; cmp rax, 0x61; jne _cdpi_hdr_bad;  // a
+        xor rax, rax; mov_b rax, [r8 + 22]; cmp rax, 0x73; jne _cdpi_hdr_bad;  // s
+        xor rax, rax; mov_b rax, [r8 + 23]; cmp rax, 0x3A; jne _cdpi_hdr_bad;  // ':'
+
+        add r8, 24;
+
+        mov r13, r8;
+      _cdpi_sch_check_none:
+        cmp r13, r9;
+        jge _cdpi_sch_open_section;
+        xor rax, rax;
+        mov_b rax, [r13];
+        cmp rax, 0x0A;
+        je _cdpi_sch_open_section;
+        cmp rax, 0x20;
+        je _cdpi_sch_bump_none;
+        cmp rax, 0x28;
+        je _cdpi_sch_try_none;
+        mov rax, 0xFFFFFFF8;            // CAPS_DECL_MALFORMED_HEADER
+        jmp _cdpi_parse_fail;
+
+      _cdpi_sch_bump_none:
+        add r13, 1;
+        jmp _cdpi_sch_check_none;
+
+      _cdpi_sch_try_none:
+        xor rax, rax; mov_b rax, [r13 + 1]; cmp rax, 0x6E; jne _cdpi_hdr_bad;  // n
+        xor rax, rax; mov_b rax, [r13 + 2]; cmp rax, 0x6F; jne _cdpi_hdr_bad;  // o
+        xor rax, rax; mov_b rax, [r13 + 3]; cmp rax, 0x6E; jne _cdpi_hdr_bad;  // n
+        xor rax, rax; mov_b rax, [r13 + 4]; cmp rax, 0x65; jne _cdpi_hdr_bad;  // e
+        xor rax, rax; mov_b rax, [r13 + 5]; cmp rax, 0x29; jne _cdpi_hdr_bad;  // ')'
+        xor r10, r10;                   // state = STATE_TOP
+        add r13, 6;
+        mov r8, r13;
+        jmp _cdpi_line_skip_to_nl;
+
+      _cdpi_sch_open_section:
+        mov r10, 2;                     // STATE_SCH
+        mov r8, r13;
+        jmp _cdpi_line_skip_to_nl;
+
+      _cdpi_hdr_bad:
+        mov rax, 0xFFFFFFF8;            // CAPS_DECL_MALFORMED_HEADER
+        jmp _cdpi_parse_fail;
+
+      // ==== "- IDENT..." list item =========================================
+      _cdpi_try_list_item:
+        cmp r10, 0;
+        je _cdpi_item_out_of_section;
+
+        add r8, 1;
+      _cdpi_item_skip_lead_ws:
+        cmp r8, r9;
+        jge _cdpi_item_bad;
+        xor rax, rax;
+        mov_b rax, [r8];
+        cmp rax, 0x20;
+        je _cdpi_item_bump_ws;
+        cmp rax, 0x09;
+        je _cdpi_item_bump_ws;
+        cmp rax, 0x0A;
+        je _cdpi_item_bad;
+        jmp _cdpi_item_ident_start;
+      _cdpi_item_bump_ws:
+        add r8, 1;
+        jmp _cdpi_item_skip_lead_ws;
+
+      _cdpi_item_ident_start:
+        mov rdx, r8;                    // rdx = ident start
+        mov r13, r8;                    // r13 = walk cursor
+
+      _cdpi_item_walk_ident:
+        cmp r13, r9;
+        jge _cdpi_item_ident_done_eof;
+        xor rax, rax;
+        mov_b rax, [r13];
+        cmp rax, 0x28;                  // '('
+        je _cdpi_item_ident_done_paren;
+        cmp rax, 0x40;                  // '@'
+        je _cdpi_item_ident_done_at;
+        cmp rax, 0x20;
+        je _cdpi_item_ident_done_ws;
+        cmp rax, 0x09;
+        je _cdpi_item_ident_done_ws;
+        cmp rax, 0x0A;
+        je _cdpi_item_ident_done_nl;
+        add r13, 1;
+        jmp _cdpi_item_walk_ident;
+
+      // ---- Boundary-byte terminations: NUL-terminate + branch -------------
+      // See src/caps_decl.pdx §405 for the libpdx-cap#15 rationale — r14
+      // signals to _cdpi_item_tail whether to re-scan for the trailing
+      // '\n' (0) or to step past the already-consumed EOL (1).
+      _cdpi_item_ident_done_paren:
+        mov rcx, r13;                   // rcx = ptr to '(' for args record
+        xor rax, rax;
+        mov_b [r13], rax;               // NUL-terminate identifier
+        xor r14, r14;                   // scan needed: "@owner" may follow
+        jmp _cdpi_item_record;
+
+      _cdpi_item_ident_done_at:
+      _cdpi_item_ident_done_ws:
+        xor rcx, rcx;
+        xor rax, rax;
+        mov_b [r13], rax;
+        xor r14, r14;                   // scan needed
+        jmp _cdpi_item_record;
+
+      _cdpi_item_ident_done_nl:
+        xor rcx, rcx;
+        xor rax, rax;
+        mov_b [r13], rax;
+        mov r14, 1;                     // already at (consumed) EOL
+        jmp _cdpi_item_record;
+
+      _cdpi_item_ident_done_eof:
+        xor rcx, rcx;
+        mov r14, 1;                     // already at true EOF
+        jmp _cdpi_item_record;
+
+      // ---- Item record ----------------------------------------------------
+      _cdpi_item_record:
+        cmp r10, 1;                     // STATE_REQ
+        je _cdpi_item_record_req;
+        cmp r10, 2;                     // STATE_SCH
+        je _cdpi_item_record_sch;
+        mov rax, 0xFFFFFFF6;            // CAPS_DECL_ITEM_OUT_OF_SECTION
+        jmp _cdpi_parse_fail;
+
+      _cdpi_item_record_req:
+        // req_count at ctx[+256]; req_kind_names base at ctx[+0];
+        // req_args_texts base at ctx[+128].
+        lea r11, [r15 + 256];           // CAPS_DECL_CTX_REQ_COUNT_OFF
+        mov rax, [r11];
+        cmp rax, 16;                    // CAPS_DECL_MAX_REQ
+        jge _cdpi_req_overflow;
+
+        lea r11, [r15 + 0];             // CAPS_DECL_CTX_REQ_KIND_NAMES_OFF
+        mov [r11 + rax*8], rdx;
+
+        lea r11, [r15 + 128];           // CAPS_DECL_CTX_REQ_ARGS_TEXTS_OFF
+        mov [r11 + rax*8], rcx;
+
+        add rax, 1;
+        lea r11, [r15 + 256];
+        mov [r11], rax;
+
+        jmp _cdpi_item_tail;
+
+      _cdpi_item_record_sch:
+        lea r11, [r15 + 392];           // CAPS_DECL_CTX_SCHEMA_COUNT_OFF
+        mov rax, [r11];
+        cmp rax, 16;                    // CAPS_DECL_MAX_SCHEMAS
+        jge _cdpi_sch_overflow;
+
+        lea r11, [r15 + 264];           // CAPS_DECL_CTX_SCHEMA_NAMES_OFF
+        mov [r11 + rax*8], rdx;
+
+        add rax, 1;
+        lea r11, [r15 + 392];
+        mov [r11], rax;
+
+        jmp _cdpi_item_tail;
+
+      // ---- Shared post-store tail (libpdx-cap#15 fix, mirrored) -----------
+      _cdpi_item_tail:
+        cmp r14, 0;
+        je _cdpi_item_tail_scan;
+
+        mov r8, r13;
+        add r8, 1;                      // step past the consumed '\n'
+        add r12, 1;                     // line_index++
+        jmp _cdpi_line_head;
+
+      _cdpi_item_tail_scan:
+        mov r8, r13;
+        jmp _cdpi_line_skip_to_nl;
+
+      _cdpi_item_bad:
+        mov rax, 0xFFFFFFF7;            // CAPS_DECL_MALFORMED_ITEM
+        jmp _cdpi_parse_fail;
+
+      _cdpi_item_out_of_section:
+        mov rax, 0xFFFFFFF6;            // CAPS_DECL_ITEM_OUT_OF_SECTION
+        jmp _cdpi_parse_fail;
+
+      _cdpi_req_overflow:
+        mov rax, 0xFFFFFFFA;            // CAPS_DECL_REQ_OVERFLOW
+        jmp _cdpi_parse_fail;
+
+      _cdpi_sch_overflow:
+        mov rax, 0xFFFFFFF9;            // CAPS_DECL_SCHEMA_OVERFLOW
+        jmp _cdpi_parse_fail;
+
+      // ==== per-line trailer helpers =======================================
+      _cdpi_line_skip_to_nl:
+        cmp r8, r9;
+        jge _cdpi_line_at_eof;
+        xor rax, rax;
+        mov_b rax, [r8];
+        cmp rax, 0x0A;
+        je _cdpi_line_consume_nl;
+        add r8, 1;
+        jmp _cdpi_line_skip_to_nl;
+
+      _cdpi_line_consume_nl:
+        add r8, 1;
+        add r12, 1;
+        jmp _cdpi_line_head;
+
+      _cdpi_line_at_eof:
+        add r12, 1;
+        jmp _cdpi_parse_done_ok;
+
+      _cdpi_line_advance_newline_or_end:
+        jmp _cdpi_parse_done_ok;
+
+      // ==== exits ==========================================================
+      _cdpi_parse_done_ok:
+        xor rax, rax;                   // CAPS_DECL_OK
+        lea r11, [r15 + 400];           // CAPS_DECL_CTX_ERROR_CODE_OFF
+        mov [r11], rax;
+        jmp _cdpi_parse_epilogue;
+
+      _cdpi_parse_fail:
+        lea r11, [r15 + 400];           // CAPS_DECL_CTX_ERROR_CODE_OFF
+        mov [r11], rax;
+        lea r11, [r15 + 408];           // CAPS_DECL_CTX_ERROR_LINE_INDEX_OFF
+        mov [r11], r12;
+        // Fall through to epilogue with rax preserved.
+
+      _cdpi_parse_epilogue:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // cap_manifest_verify_into(decl_ctx, received_ptr, received_count) -> rc
+  //
+  // Signature: cap_manifest_verify_into : (u64, u64, u64) -> u64 !{mem} @{}
+  // RDI (input): decl_ctx       — VA of a 416-byte CapsDecl context
+  //                                populated by caps_decl_parse_into.
+  // RSI (input): received_ptr   — VA of a Cap[] wire array (each record
+  //                                16 bytes, 8-byte aligned).
+  // RDX (input): received_count — number of Cap records in received_ptr.
+  // RAX (output): CAP_OK | CAP_MANIFEST_MISSING | CAP_MANIFEST_EXTRA
+  //             | CAP_KIND_UNKNOWN
+  //
+  // Caller-owned variant of Cap::cap_manifest_verify. Finally does what
+  // that entry's decl_ptr parameter was reserved for at 1.0: it treats
+  // its first arg as a real caller-owned CapsDecl context and reads
+  // req_count / req_kind_names from decl_ctx[+256] / decl_ctx[+0]
+  // instead of from the CapsDecl singleton. Semantics are otherwise
+  // bit-identical to the singleton version (two-pass compare, same
+  // MISSING / EXTRA / KIND_UNKNOWN vocabulary, same fail-fast on the
+  // unknown-kind case).
+  //
+  // Register plan (non-leaf; calls kind_names_resolve):
+  //   r12 = pass 1 outer loop i / pass 2 outer loop i
+  //   r13 = pass 1 inner scan j / pass 2 inner scan j
+  //   r14 = received_ptr (survives nested calls)      [callee-save]
+  //   r15 = received_count (survives nested calls)    [callee-save]
+  //   rbx = pass-2 recv kind held across the inner call
+  //   rbp = decl_ctx (survives nested calls)          [callee-save]
+  //   rax = kind_names_resolve result / return code
+  //   rcx = pass-1 target ord scratch
+  //   r11 = LEA scratch for decl_ctx base+off computations
+  //
+  // rsp alignment: 6 callee-save pushes (r12/r13/r14/r15/rbx/rbp) plus
+  // an 8-byte pad. Entry rsp % 16 == 8; 6 pushes (-48) → rsp % 16 == 8;
+  // an extra `sub rsp, 8` pad → rsp % 16 == 0 at every nested-call site.
+  // Matched `add rsp, 8` before pops preserves SysV parity on every exit.
+  // ============================================================================
+  pub let cap_manifest_verify_into : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (decl_ctx: u64) (received_ptr: u64) (received_count: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-cap.ENH-008 cap_manifest_verify_into. Caller-owned variant of Cap::cap_manifest_verify (src/cap.pdx line 569). Two-pass compare between the caller's CapsDecl context (req_kind_names[] at decl_ctx[+0], req_count at decl_ctx[+256]) and the received Cap[] array. Pass 1 (MISSING): resolve each declared name via KindNames::kind_names_resolve, linear-scan received[] for a matching kind lane. Pass 2 (EXTRA): for each received Cap, extract its kind lane and scan the declared names. Returns CAP_OK, CAP_MANIFEST_MISSING, CAP_MANIFEST_EXTRA, or CAP_KIND_UNKNOWN (if the decl names a kind libpdx-cap does not mirror) — same vocabulary as the singleton. This is the entry Cap::cap_manifest_verify's reserved decl_ptr parameter documented as 'reserved for the M4 caller-owned variant' (src/cap.pdx line 522); it does not modify or supplant the singleton entry (which continues to ignore its decl_ptr). Kind lane extraction reuses the shift-and-mask idiom from cap_unpack (qword0 >> 16 & 0xFFFF). paideia-as conformance: r11 is LEA scratch (into decl_ctx, not .bss); every cmp reg,imm uses imm ≤ 0x7FFFFFFF (largest is 0xFFFF for the kind mask); no `test` mnemonic; byte reads N/A (all loads are qwords). Non-leaf: 6 callee-save pushes (r12/r13/r14/r15/rbx/rbp) plus an 8-byte pad (sub rsp,8) → rsp % 16 == 0 at every nested-call site (entry 8; six pushes leave rsp % 16 == 8, pad flips to 0). Matched add rsp,8 before pops on every exit.",
+      block: {
+        // ---- prologue ------------------------------------------------------
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        push rbx;
+        push rbp;
+        sub rsp, 8;                     // alignment pad (see reg plan above)
+
+        mov r14, rsi;                   // r14 = received_ptr
+        mov r15, rdx;                   // r15 = received_count
+        mov rbp, rdi;                   // rbp = decl_ctx
+
+        // ==================================================================
+        // Pass 1: for each declared kind name, must appear in received[].
+        // ==================================================================
+        xor r12, r12;                   // i = 0
+
+      _cmvi_pass1_head:
+        // req_count at decl_ctx[+256].
+        mov rax, [rbp + 256];
+        cmp r12, rax;
+        jge _cmvi_pass2_init;
+
+        // name = decl_ctx.req_kind_names[i]
+        lea r11, [rbp + 0];             // CAPS_DECL_CTX_REQ_KIND_NAMES_OFF
+        mov rdi, [r11 + r12*8];
+
+        call kind_names_resolve;
+
+        // Compare rax against CAP_KIND_UNKNOWN (large imm → via r11).
+        mov r11, 0xFFFFFFF4;
+        cmp rax, r11;
+        je _cmvi_unknown_kind;
+
+        // rax = target ordinal. Save it and scan received[].
+        mov rcx, rax;                   // rcx = target kind ord
+        xor r13, r13;                   // j = 0
+
+      _cmvi_pass1_scan_recv:
+        cmp r13, r15;
+        jge _cmvi_missing;
+
+        // recv kind = (received[j].qword0 >> 16) & 0xFFFF
+        mov r8, r14;
+        mov rax, r13;
+        shl rax, 4;                     // j * 16 (Cap record stride)
+        add r8, rax;                    // &received[j]
+        mov rax, [r8];                  // qword0
+        shr rax, 16;
+        and rax, 0xFFFF;
+        cmp rax, rcx;
+        je _cmvi_pass1_next_decl;
+
+        add r13, 1;
+        jmp _cmvi_pass1_scan_recv;
+
+      _cmvi_pass1_next_decl:
+        add r12, 1;
+        jmp _cmvi_pass1_head;
+
+        // ==================================================================
+        // Pass 2: for each received Cap, must appear in decl (by kind).
+        // ==================================================================
+      _cmvi_pass2_init:
+        xor r12, r12;                   // i = 0 (over received[])
+
+      _cmvi_pass2_head:
+        cmp r12, r15;
+        jge _cmvi_ok;
+
+        // recv kind = (received[i].qword0 >> 16) & 0xFFFF
+        mov r8, r14;
+        mov rax, r12;
+        shl rax, 4;
+        add r8, rax;
+        mov rax, [r8];
+        shr rax, 16;
+        and rax, 0xFFFF;
+        mov rbx, rax;                   // rbx = current recv kind
+
+        xor r13, r13;                   // j = 0 (over decl)
+
+      _cmvi_pass2_scan_decl:
+        // req_count at decl_ctx[+256].
+        mov rax, [rbp + 256];
+        cmp r13, rax;
+        jge _cmvi_extra;
+
+        lea r11, [rbp + 0];             // CAPS_DECL_CTX_REQ_KIND_NAMES_OFF
+        mov rdi, [r11 + r13*8];
+
+        call kind_names_resolve;
+
+        // rbx fits in u16, no large-imm compare needed.
+        cmp rax, rbx;
+        je _cmvi_pass2_next_recv;
+
+        add r13, 1;
+        jmp _cmvi_pass2_scan_decl;
+
+      _cmvi_pass2_next_recv:
+        add r12, 1;
+        jmp _cmvi_pass2_head;
+
+        // ==================================================================
+        // Exits
+        // ==================================================================
+      _cmvi_ok:
+        xor rax, rax;                   // CAP_OK
+        jmp _cmvi_epilogue;
+
+      _cmvi_missing:
+        mov rax, 0xFFFFFFFC;            // CAP_MANIFEST_MISSING
+        jmp _cmvi_epilogue;
+
+      _cmvi_extra:
+        mov rax, 0xFFFFFFFB;            // CAP_MANIFEST_EXTRA
+        jmp _cmvi_epilogue;
+
+      _cmvi_unknown_kind:
+        mov rax, 0xFFFFFFF4;            // CAP_KIND_UNKNOWN
+
+      _cmvi_epilogue:
+        add rsp, 8;                     // release alignment pad
+        pop rbp;
+        pop rbx;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+}

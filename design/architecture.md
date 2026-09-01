@@ -161,10 +161,22 @@ bootstrap:
 - **Zero heap dependency.** libpdx-cap predates any allocator in the
   R49 wave; every buffer is a static array.
 
-M4 (`libpdx-cap.M4-001`) reruns the round-trip fuzz against a
-caller-owned `Cap*` variant so tests can build many contexts in one
-process. That extension changes only the two module entry points —
-consumers keep the same field names.
+**ENH-008 (libpdx-cap#18) — caller-owned re-entrant variants (landed).**
+The two "post-M4 concerns" above are now addressed additively by a
+sixth module, `CapCtx` (`src/cap_ctx.pdx`), that ships alongside the
+singleton entry points without modifying them: `cap_unpack_into`,
+`cap_unpack_checked_into`, `caps_decl_parse_into`, and
+`cap_manifest_verify_into` all take caller-supplied context pointers
+instead of writing to the module `.bss`. Context layouts are published
+as constants (`CAP_CTX_SIZE = 32`, `CAPS_DECL_CTX_SIZE = 416`, plus
+per-field offset constants) so a caller sizes its own buffer without a
+header. The M1 API keeps working against the original singletons
+(`ls`, which uses the M1 API, needs no change); the M4-002 witness
+carries a 10-stage sub-corpus (S31..S40) proving two live Cap contexts
+and two live CapsDecl contexts coexist in one process and yield the
+correct values from both. `cap_manifest_verify`'s `decl_ptr` parameter
+remains reserved (unchanged 1.0 ABI); the caller-owned variant lives
+under the `_into` name.
 
 ## 4. `caps.decl` parser (M1-002)
 
@@ -570,7 +582,7 @@ and callable from any consumer that links libpdx-cap:
   seed (`M4RF_LCG_SEED = 0xC0FFEE5EA5CAB1E7`) so a failure at
   iteration `N` is reproducible.
 - `M4CapsDeclMatrix::m4_002_caps_decl_matrix` (M4-002) —
-  30-stage matrix covering:
+  40-stage matrix covering:
   - **Parse-error corpus (S1..S8):** OK inline, OK one-item,
     MALFORMED_HEADER (x2), ITEM_OUT_OF_SECTION, MALFORMED_ITEM,
     REQ_OVERFLOW, SCHEMA_OVERFLOW — one fixture per
@@ -601,6 +613,21 @@ and callable from any consumer that links libpdx-cap:
     case also asserts `dst` is left byte-for-byte untouched — the
     fail-fast contract `src/cap.pdx:175` documents but which no
     earlier stage exercised.
+  - **Caller-owned re-entrancy (S31..S40):** added at ENH-008
+    (libpdx-cap#18) to exercise the `CapCtx` module's five
+    `_into` entry points with two live Cap contexts and two live
+    CapsDecl contexts inside a single process. S31 and S32 parse
+    two different fixtures into two decl ctxs; S33 is the
+    fingerprint stage that reads back the correct `req_count`
+    from BOTH ctxs after the second parse. S35/S36 do the
+    symmetric test for `cap_unpack_into`. S37 covers
+    `cap_unpack_checked_into`'s HIT path; S38 covers the REJECT
+    path AND asserts the cap ctx is left byte-for-byte untouched
+    (mirrors `cap_unpack_checked`'s fail-fast). S39 covers
+    `cap_manifest_verify_into` MISSING. S40 is the second
+    fingerprint stage: the SAME received wire yields DIFFERENT
+    verify results under two different decl ctxs — the shape
+    ENH-008 exists to enable.
 
 ### Fingerprint contract
 

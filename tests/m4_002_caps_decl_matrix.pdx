@@ -41,6 +41,23 @@
 //                                   every rejecting case also asserts
 //                                   dst is left byte-for-byte
 //                                   untouched.
+//   S31..S40 caller-owned re-entrancy — ENH-008 (libpdx-cap#18): two
+//                                   live Cap contexts and two live
+//                                   CapsDecl contexts inside ONE
+//                                   process. Proves caps_decl_parse_into,
+//                                   cap_unpack_into,
+//                                   cap_unpack_checked_into, and
+//                                   cap_manifest_verify_into behave
+//                                   correctly under fan-out
+//                                   (`shell` → N children shape).
+//                                   Includes the ENH-008 fingerprint:
+//                                   a stage that reads correct values
+//                                   from BOTH contexts back-to-back
+//                                   after the second was written
+//                                   (S33 for decl ctxs, S36 for cap
+//                                   ctxs, S40 for the same recv wire
+//                                   producing different verify results
+//                                   under two different decl ctxs).
 //
 // Fingerprint contract
 // --------------------
@@ -188,6 +205,32 @@ module M4CapsDeclMatrix = structure {
   // assertion never races a value another sub-corpus wrote earlier.
   pub let mut _m4mx_slot_buf : [u8; 16] = uninit @align(8)
 
+  // ---- ENH-008 (libpdx-cap#18) re-entrancy fixtures --------------------
+  //
+  // Two caller-owned Cap contexts (32 B each, CAP_CTX_SIZE from
+  // src/cap_ctx.pdx) and two caller-owned CapsDecl contexts (416 B
+  // each, CAPS_DECL_CTX_SIZE). Held live simultaneously across
+  // S31..S40 so the fingerprint stages can prove no _into call
+  // touches the other context. Alignment is 8 B per the published
+  // CAP_CTX_ALIGN / CAPS_DECL_CTX_ALIGN constants.
+  pub let mut _m4mx_capctx_a  : [u8; 32]  = uninit @align(8)
+  pub let mut _m4mx_capctx_b  : [u8; 32]  = uninit @align(8)
+  pub let mut _m4mx_declctx_a : [u8; 416] = uninit @align(8)
+  pub let mut _m4mx_declctx_b : [u8; 416] = uninit @align(8)
+
+  // Fresh copy of the tty_user fixture dedicated to S33. The shared
+  // `_m4mx_decl_tty_user` above is consumed at Stage 15's singleton
+  // parse, which NUL-terminates each item boundary in place. Re-parsing
+  // that same buffer thereafter collapses the two-item content to a
+  // single long "KIND_TTY\\0- KIND_USER\\0" identifier (the walker
+  // treats \\0 as non-boundary and no '\\n' bytes remain to end the
+  // walk), so req_count would read back as 1 instead of 2 — a fixture
+  // artifact, not a parser bug. A dedicated copy is the same discipline
+  // Stage 15 uses (the singleton parse of tty_user is the fixture's
+  // only prior consumer).
+  pub let mut _m4mx_decl_tty_user_e8 : [u8; 33] =
+    "requires:\n- KIND_TTY\n- KIND_USER\n"
+
   // Current stage number — mirror of the return value. Written at
   // the top of every stage; on failure the caller can read it to
   // confirm which stage exited.
@@ -212,7 +255,7 @@ module M4CapsDeclMatrix = structure {
   pub let m4_002_caps_decl_matrix : () -> u64 !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-cap.M4-002 caps.decl matrix witness. Runs 30 stages covering (a) the 8-entry parse-error corpus for CapsDecl (OK inline, OK one-item, MALFORMED_HEADER x2, ITEM_OUT_OF_SECTION, MALFORMED_ITEM, REQ_OVERFLOW, SCHEMA_OVERFLOW), (b) the 4-case narrowing invariant matrix for cap_pack_narrowed (subset OK, equal OK, superset WIDENING, empty-orig any-narrow WIDENING), (c) the 5-case extra-cap rejection matrix for cap_unpack_checked + cap_manifest_verify (EXTRA on unpack, OK on unpack, MISSING on verify, EXTRA on verify, KIND_UNKNOWN on verify), (d) the 5-case signed-inode helper suite (KEY_LOCKED after reset, OK after set(1), BAD_INODE on null has_signature, has_signature + mark_unsigned round-trip, BAD_INODE on null mark_unsigned), and (e) the 8-case slot-bound suite added at ENH-005 (libpdx-cap#14) for cap_pack and cap_pack_narrowed each: slot=255 accept, slot=256/0xFFFF/0x8000000000000000 all CAP_BAD_SLOT with dst asserted byte-for-byte untouched (the ENH-004/libpdx-cap#13 signed-jge regression guard — a reverted jae would fail open on the 2^63 case and either corrupt dst or return CAP_OK). Each stage writes the 1-based stage index to _m4mx_stage before asserting; on the first failure returns that index in rax. On all-pass returns 0. paideia-as conformance: every large-imm compare (all CAPS_DECL_*, CAP_*, SIGNED_INODE_* error codes are 0xFFFFFFxx, plus the 0x8000000000000000 slot value and the 0xDEADBEEFCAFEBABE untouched-dst sentinel) uses `mov r11, imm64; cmp rax, r11` staging — same idiom as cap_manifest_verify line 580, extended to 64-bit immediates the same way tests/m4_001_roundtrip_fuzz.pdx stages its LCG constants; every small-imm compare (0, 1, 0xFF, 0xFFFF, 255, 256) is direct. No `test` mnemonic. r11 is scratch (LEA + imm staging); r10 is scratch for the slot-bound buffer address across the sentinel fill/check (never assumed live across a call — recomputed via `lea` after every nested call, matching the module's existing r11 discipline). Byte writes (setting sig_present=1 on the fixture inode) use `mov_b [r11], reg` — mirror of caps_decl.pdx's NUL-terminate store. Non-leaf: one callee-save push (rbx, unused; pure alignment pad) → rsp % 16 == 0 at every nested-call site. All state is in .bss; no cross-call callee-save reg needed. Fixtures are .data (mutable initialized) so `caps_decl_parse`'s in-place NUL-termination lands in writable memory; fixture text is idempotent under repeated parse per the module-header analysis (walker treats '\\0' as non-boundary so a re-parse walks past the NUL to the next boundary).",
+      justification: "libpdx-cap.M4-002 caps.decl matrix witness. Runs 40 stages covering (a) the 8-entry parse-error corpus for CapsDecl (OK inline, OK one-item, MALFORMED_HEADER x2, ITEM_OUT_OF_SECTION, MALFORMED_ITEM, REQ_OVERFLOW, SCHEMA_OVERFLOW), (b) the 4-case narrowing invariant matrix for cap_pack_narrowed (subset OK, equal OK, superset WIDENING, empty-orig any-narrow WIDENING), (c) the 5-case extra-cap rejection matrix for cap_unpack_checked + cap_manifest_verify (EXTRA on unpack, OK on unpack, MISSING on verify, EXTRA on verify, KIND_UNKNOWN on verify), (d) the 5-case signed-inode helper suite (KEY_LOCKED after reset, OK after set(1), BAD_INODE on null has_signature, has_signature + mark_unsigned round-trip, BAD_INODE on null mark_unsigned), (e) the 8-case slot-bound suite added at ENH-005 (libpdx-cap#14) for cap_pack and cap_pack_narrowed each: slot=255 accept, slot=256/0xFFFF/0x8000000000000000 all CAP_BAD_SLOT with dst asserted byte-for-byte untouched (the ENH-004/libpdx-cap#13 signed-jge regression guard — a reverted jae would fail open on the 2^63 case and either corrupt dst or return CAP_OK), and (f) the 10-case caller-owned re-entrancy suite added at ENH-008 (libpdx-cap#18): caps_decl_parse_into into two live decl ctxs with a mid-stage cross-read that confirms the second parse did not touch the first ctx; cap_unpack_into into two live cap ctxs with a symmetric cross-read; cap_unpack_checked_into HIT and REJECT paths (REJECT asserts the cap ctx is left untouched, mirroring the singleton's fail-fast); cap_manifest_verify_into MISSING / EXTRA / KIND_UNKNOWN plus the fingerprint stage where the SAME received wire yields DIFFERENT verify results under two different decl ctxs (the shape ENH-008 exists to enable). Each stage writes the 1-based stage index to _m4mx_stage before asserting; on the first failure returns that index in rax. On all-pass returns 0. paideia-as conformance: every large-imm compare (all CAPS_DECL_*, CAP_*, SIGNED_INODE_* error codes are 0xFFFFFFxx, plus the 0x8000000000000000 slot value and the 0xDEADBEEFCAFEBABE untouched-dst sentinel) uses `mov r11, imm64; cmp rax, r11` staging — same idiom as cap_manifest_verify line 580, extended to 64-bit immediates the same way tests/m4_001_roundtrip_fuzz.pdx stages its LCG constants; every small-imm compare (0, 1, 0xFF, 0xFFFF, 255, 256) is direct. No `test` mnemonic. r11 is scratch (LEA + imm staging); r10 is scratch for the slot-bound buffer address across the sentinel fill/check (never assumed live across a call — recomputed via `lea` after every nested call, matching the module's existing r11 discipline). Byte writes (setting sig_present=1 on the fixture inode) use `mov_b [r11], reg` — mirror of caps_decl.pdx's NUL-terminate store. Non-leaf: one callee-save push (rbx, unused; pure alignment pad) → rsp % 16 == 0 at every nested-call site. All state is in .bss; no cross-call callee-save reg needed. Fixtures are .data (mutable initialized) so `caps_decl_parse`'s in-place NUL-termination lands in writable memory; fixture text is idempotent under repeated parse per the module-header analysis (walker treats '\\0' as non-boundary so a re-parse walks past the NUL to the next boundary).",
       block: {
         // ---- prologue (alignment pad) --------------------------------------
         push rbx;
@@ -881,6 +924,394 @@ module M4CapsDeclMatrix = structure {
         jne _m4mx_fail;
         mov rax, [r10 + 8];
         cmp rax, r11;
+        jne _m4mx_fail;
+
+        // ====================================================================
+        // Sub-corpus F: caller-owned re-entrancy (S31..S40) — ENH-008
+        // (libpdx-cap#18). Exercises src/cap_ctx.pdx's five entry points
+        // with two live Cap ctxs and two live CapsDecl ctxs.
+        // ====================================================================
+
+        // ---- Stage 31: caps_decl_parse_into ok1 (empty sections) into
+        //                declctx_a. req_count == 0; error_code == 0.
+        mov rax, 31;
+        lea r11, [rip + _m4mx_stage];
+        mov [r11], rax;
+
+        lea rdi, [rip + _m4mx_declctx_a];
+        call caps_decl_ctx_reset;
+
+        lea rdi, [rip + _m4mx_declctx_a];
+        lea rsi, [rip + _m4mx_decl_ok1];
+        mov rdx, 49;
+        call caps_decl_parse_into;
+        cmp rax, 0;
+        jne _m4mx_fail;
+
+        // declctx_a.req_count at [+256].
+        lea r11, [rip + _m4mx_declctx_a];
+        mov rax, [r11 + 256];
+        cmp rax, 0;
+        jne _m4mx_fail;
+
+        // declctx_a.error_code at [+400].
+        lea r11, [rip + _m4mx_declctx_a];
+        mov rax, [r11 + 400];
+        cmp rax, 0;
+        jne _m4mx_fail;
+
+        // ---- Stage 32: caps_decl_parse_into ok2 (one KIND_TTY item)
+        //                into declctx_b. req_count == 1; error_code == 0.
+        mov rax, 32;
+        lea r11, [rip + _m4mx_stage];
+        mov [r11], rax;
+
+        lea rdi, [rip + _m4mx_declctx_b];
+        call caps_decl_ctx_reset;
+
+        lea rdi, [rip + _m4mx_declctx_b];
+        lea rsi, [rip + _m4mx_decl_ok2];
+        mov rdx, 21;
+        call caps_decl_parse_into;
+        cmp rax, 0;
+        jne _m4mx_fail;
+
+        lea r11, [rip + _m4mx_declctx_b];
+        mov rax, [r11 + 256];
+        cmp rax, 1;
+        jne _m4mx_fail;
+
+        lea r11, [rip + _m4mx_declctx_b];
+        mov rax, [r11 + 400];
+        cmp rax, 0;
+        jne _m4mx_fail;
+
+        // ---- Stage 33: interleaved decl ctxs — parse tty_user (2
+        //                items) into declctx_a; both declctx_a AND
+        //                declctx_b read back the correct counts. This
+        //                is the ENH-008 fingerprint for CapsDecl
+        //                re-entrancy.
+        mov rax, 33;
+        lea r11, [rip + _m4mx_stage];
+        mov [r11], rax;
+
+        lea rdi, [rip + _m4mx_declctx_a];
+        call caps_decl_ctx_reset;
+
+        lea rdi, [rip + _m4mx_declctx_a];
+        lea rsi, [rip + _m4mx_decl_tty_user_e8];
+        mov rdx, 33;
+        call caps_decl_parse_into;
+        cmp rax, 0;
+        jne _m4mx_fail;
+
+        // declctx_a.req_count now 2 (KIND_TTY + KIND_USER).
+        lea r11, [rip + _m4mx_declctx_a];
+        mov rax, [r11 + 256];
+        cmp rax, 2;
+        jne _m4mx_fail;
+
+        // declctx_b.req_count STILL 1 (S32) — the second parse did NOT
+        // touch the first context.
+        lea r11, [rip + _m4mx_declctx_b];
+        mov rax, [r11 + 256];
+        cmp rax, 1;
+        jne _m4mx_fail;
+
+        // ---- Stage 34: caps_decl_parse_into MALFORMED_HEADER into
+        //                declctx_b. error_code + error_line_index land
+        //                in declctx_b's own slots.
+        mov rax, 34;
+        lea r11, [rip + _m4mx_stage];
+        mov [r11], rax;
+
+        lea rdi, [rip + _m4mx_declctx_b];
+        call caps_decl_ctx_reset;
+
+        lea rdi, [rip + _m4mx_declctx_b];
+        lea rsi, [rip + _m4mx_decl_malf_hdr1];
+        mov rdx, 7;
+        call caps_decl_parse_into;
+        mov r11, 0xFFFFFFF8;              // CAPS_DECL_MALFORMED_HEADER
+        cmp rax, r11;
+        jne _m4mx_fail;
+
+        lea r11, [rip + _m4mx_declctx_b];
+        mov rax, [r11 + 400];             // error_code
+        mov r11, 0xFFFFFFF8;
+        cmp rax, r11;
+        jne _m4mx_fail;
+
+        lea r11, [rip + _m4mx_declctx_b];
+        mov rax, [r11 + 408];             // error_line_index
+        cmp rax, 0;
+        jne _m4mx_fail;
+
+        // ---- Stage 35: cap_unpack_into into capctx_a. Pack a KIND_TTY
+        //                cap into wire[0]; unpack into capctx_a; assert
+        //                the four lanes read back correctly.
+        mov rax, 35;
+        lea r11, [rip + _m4mx_stage];
+        mov [r11], rax;
+
+        lea rdi, [rip + _m4mx_capctx_a];
+        call cap_ctx_reset;
+
+        // Pack cap_buf[0..16] = (slot=5, kind=0x197, rights=0xB, target=0x1122334455667788).
+        lea rdi, [rip + _m4mx_cap_buf];
+        mov rsi, 5;
+        mov rdx, 0x197;                   // KIND_TTY
+        mov rcx, 0xB;
+        mov r8, 0x1122334455667788;
+        call cap_pack;
+        cmp rax, 0;
+        jne _m4mx_fail;
+
+        // Unpack into capctx_a.
+        lea rdi, [rip + _m4mx_capctx_a];
+        lea rsi, [rip + _m4mx_cap_buf];
+        call cap_unpack_into;
+        cmp rax, 0;
+        jne _m4mx_fail;
+
+        // capctx_a.slot (+0) = 5.
+        lea r11, [rip + _m4mx_capctx_a];
+        mov rax, [r11 + 0];
+        cmp rax, 5;
+        jne _m4mx_fail;
+
+        // capctx_a.kind (+8) = 0x197.
+        lea r11, [rip + _m4mx_capctx_a];
+        mov rax, [r11 + 8];
+        cmp rax, 0x197;
+        jne _m4mx_fail;
+
+        // capctx_a.rights (+16) = 0xB.
+        lea r11, [rip + _m4mx_capctx_a];
+        mov rax, [r11 + 16];
+        cmp rax, 0xB;
+        jne _m4mx_fail;
+
+        // capctx_a.target_ptr (+24) = 0x1122334455667788.
+        lea r11, [rip + _m4mx_capctx_a];
+        mov rax, [r11 + 24];
+        mov r11, 0x1122334455667788;
+        cmp rax, r11;
+        jne _m4mx_fail;
+
+        // ---- Stage 36: interleaved cap ctxs — pack a different cap
+        //                into cap_buf[16..32], unpack into capctx_b, and
+        //                confirm capctx_a still holds its S35 values.
+        //                ENH-008 fingerprint for Cap re-entrancy.
+        mov rax, 36;
+        lea r11, [rip + _m4mx_stage];
+        mov [r11], rax;
+
+        lea rdi, [rip + _m4mx_capctx_b];
+        call cap_ctx_reset;
+
+        // Pack cap_buf[16..32] = (slot=7, kind=0x190, rights=0x3, target=0).
+        lea rdi, [rip + _m4mx_cap_buf];
+        add rdi, 16;
+        mov rsi, 7;
+        mov rdx, 0x190;                   // KIND_USER
+        mov rcx, 3;
+        xor r8, r8;
+        call cap_pack;
+        cmp rax, 0;
+        jne _m4mx_fail;
+
+        // Unpack into capctx_b.
+        lea rdi, [rip + _m4mx_capctx_b];
+        lea rsi, [rip + _m4mx_cap_buf];
+        add rsi, 16;
+        call cap_unpack_into;
+        cmp rax, 0;
+        jne _m4mx_fail;
+
+        // capctx_b.slot = 7.
+        lea r11, [rip + _m4mx_capctx_b];
+        mov rax, [r11 + 0];
+        cmp rax, 7;
+        jne _m4mx_fail;
+
+        // capctx_b.kind = 0x190.
+        lea r11, [rip + _m4mx_capctx_b];
+        mov rax, [r11 + 8];
+        cmp rax, 0x190;
+        jne _m4mx_fail;
+
+        // capctx_a.kind STILL 0x197 — the second unpack did NOT touch
+        // the first context.
+        lea r11, [rip + _m4mx_capctx_a];
+        mov rax, [r11 + 8];
+        cmp rax, 0x197;
+        jne _m4mx_fail;
+
+        // capctx_a.slot STILL 5.
+        lea r11, [rip + _m4mx_capctx_a];
+        mov rax, [r11 + 0];
+        cmp rax, 5;
+        jne _m4mx_fail;
+
+        // ---- Stage 37: cap_unpack_checked_into HIT — declctx_a has
+        //                KIND_TTY + KIND_USER (from S33). Unpack a
+        //                KIND_TTY cap into a fresh capctx_a; expect
+        //                CAP_OK and capctx_a.kind = 0x197.
+        mov rax, 37;
+        lea r11, [rip + _m4mx_stage];
+        mov [r11], rax;
+
+        lea rdi, [rip + _m4mx_capctx_a];
+        call cap_ctx_reset;
+
+        // Pack a KIND_TTY cap into cap_buf[0..16] (slot=2, rights=1, target=0).
+        lea rdi, [rip + _m4mx_cap_buf];
+        mov rsi, 2;
+        mov rdx, 0x197;                   // KIND_TTY
+        mov rcx, 1;
+        xor r8, r8;
+        call cap_pack;
+        cmp rax, 0;
+        jne _m4mx_fail;
+
+        // cap_unpack_checked_into(capctx_a, wire, declctx_a).
+        lea rdi, [rip + _m4mx_capctx_a];
+        lea rsi, [rip + _m4mx_cap_buf];
+        lea rdx, [rip + _m4mx_declctx_a];
+        call cap_unpack_checked_into;
+        cmp rax, 0;
+        jne _m4mx_fail;
+
+        // capctx_a.kind = 0x197 (populated on hit).
+        lea r11, [rip + _m4mx_capctx_a];
+        mov rax, [r11 + 8];
+        cmp rax, 0x197;
+        jne _m4mx_fail;
+
+        // ---- Stage 38: cap_unpack_checked_into REJECT — reset+parse
+        //                ok2 (KIND_TTY only) into declctx_b; pack a
+        //                KIND_USER cap; call cap_unpack_checked_into.
+        //                Expect CAP_MANIFEST_EXTRA and capctx_a is
+        //                LEFT UNTOUCHED (still holds S37's values —
+        //                fail-fast contract mirrored from
+        //                cap_unpack_checked).
+        mov rax, 38;
+        lea r11, [rip + _m4mx_stage];
+        mov [r11], rax;
+
+        // Re-populate declctx_b with just KIND_TTY.
+        lea rdi, [rip + _m4mx_declctx_b];
+        call caps_decl_ctx_reset;
+
+        lea rdi, [rip + _m4mx_declctx_b];
+        lea rsi, [rip + _m4mx_decl_ok2];
+        mov rdx, 21;
+        call caps_decl_parse_into;
+        cmp rax, 0;
+        jne _m4mx_fail;
+
+        // Pack KIND_USER (not in declctx_b) into cap_buf[0..16].
+        lea rdi, [rip + _m4mx_cap_buf];
+        mov rsi, 4;
+        mov rdx, 0x190;                   // KIND_USER
+        mov rcx, 1;
+        xor r8, r8;
+        call cap_pack;
+        cmp rax, 0;
+        jne _m4mx_fail;
+
+        // cap_unpack_checked_into against declctx_b — must reject.
+        lea rdi, [rip + _m4mx_capctx_a];
+        lea rsi, [rip + _m4mx_cap_buf];
+        lea rdx, [rip + _m4mx_declctx_b];
+        call cap_unpack_checked_into;
+        mov r11, 0xFFFFFFFB;              // CAP_MANIFEST_EXTRA
+        cmp rax, r11;
+        jne _m4mx_fail;
+
+        // capctx_a.kind STILL 0x197 (S37 value) — reject path left the
+        // ctx untouched.
+        lea r11, [rip + _m4mx_capctx_a];
+        mov rax, [r11 + 8];
+        cmp rax, 0x197;
+        jne _m4mx_fail;
+
+        // capctx_a.slot STILL 2 (S37 value).
+        lea r11, [rip + _m4mx_capctx_a];
+        mov rax, [r11 + 0];
+        cmp rax, 2;
+        jne _m4mx_fail;
+
+        // ---- Stage 39: cap_manifest_verify_into MISSING — declctx_a
+        //                requires KIND_TTY + KIND_USER but received[]
+        //                holds only one KIND_TTY cap. Expect
+        //                CAP_MANIFEST_MISSING.
+        mov rax, 39;
+        lea r11, [rip + _m4mx_stage];
+        mov [r11], rax;
+
+        // Pack cap_buf[0..16] = KIND_TTY (already done in S37 but
+        // repack for clarity).
+        lea rdi, [rip + _m4mx_cap_buf];
+        xor rsi, rsi;
+        mov rdx, 0x197;
+        mov rcx, 1;
+        xor r8, r8;
+        call cap_pack;
+        cmp rax, 0;
+        jne _m4mx_fail;
+
+        // Verify: KIND_USER missing.
+        lea rdi, [rip + _m4mx_declctx_a];
+        lea rsi, [rip + _m4mx_cap_buf];
+        mov rdx, 1;                       // received_count = 1
+        call cap_manifest_verify_into;
+        mov r11, 0xFFFFFFFC;              // CAP_MANIFEST_MISSING
+        cmp rax, r11;
+        jne _m4mx_fail;
+
+        // ---- Stage 40: ENH-008 cross-verify fingerprint — SAME
+        //                received wire (one KIND_TTY cap), TWO decl
+        //                ctxs, different results:
+        //                  * declctx_a (requires TTY + USER)  → MISSING
+        //                  * declctx_b (requires TTY only)    → OK
+        //                Neither call disturbs the other decl ctx —
+        //                cap_manifest_verify_into holds no cross-call
+        //                state in the decl ctx that would leak.
+        mov rax, 40;
+        lea r11, [rip + _m4mx_stage];
+        mov [r11], rax;
+
+        // First: against declctx_a → MISSING (KIND_USER not received).
+        lea rdi, [rip + _m4mx_declctx_a];
+        lea rsi, [rip + _m4mx_cap_buf];
+        mov rdx, 1;
+        call cap_manifest_verify_into;
+        mov r11, 0xFFFFFFFC;              // CAP_MANIFEST_MISSING
+        cmp rax, r11;
+        jne _m4mx_fail;
+
+        // Second: against declctx_b → OK (only KIND_TTY required,
+        // exactly matched).
+        lea rdi, [rip + _m4mx_declctx_b];
+        lea rsi, [rip + _m4mx_cap_buf];
+        mov rdx, 1;
+        call cap_manifest_verify_into;
+        cmp rax, 0;
+        jne _m4mx_fail;
+
+        // Confirm both decl ctxs still hold their expected req_count
+        // after the two verify calls (fingerprint: verify_into is a
+        // pure reader — never mutates the decl ctx).
+        lea r11, [rip + _m4mx_declctx_a];
+        mov rax, [r11 + 256];
+        cmp rax, 2;
+        jne _m4mx_fail;
+
+        lea r11, [rip + _m4mx_declctx_b];
+        mov rax, [r11 + 256];
+        cmp rax, 1;
         jne _m4mx_fail;
 
         // ====================================================================
