@@ -6,6 +6,16 @@ each entry maps 1:1 to a GitHub milestone in this repo (see
 `design/tooling/r49-r50-plan.md` §5.10 in the
 [paideia-os](https://github.com/paideia-os/paideia-os) repo).
 
+## 1.1.1 — 2026-09-14
+
+**Hygiene fix.** `tests/m1_002_reconcile_stub.pdx` declared module
+`M1002ReconcileStub`, a PascalCase-of-basename mismatch against the
+paideia-as strip-numeric-prefix rule (the file's milestone-index
+component `002` does not carry into the module identifier). Renamed
+the module to `M1ReconcileStub`. No callers reference this module by
+qualified name outside the file itself, so this is a self-contained
+rename with no behavioural change.
+
 ## 1.1.0 — 2026-09-13
 
 **Milestone:** Enhancement v1.x — libpdx-cap. Additive minor over

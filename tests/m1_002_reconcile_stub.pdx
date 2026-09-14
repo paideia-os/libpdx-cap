@@ -82,8 +82,10 @@
 // -----------------------------------------------------------------------------
 // paideia-as compliance
 // -----------------------------------------------------------------------------
-//   - Module name is the PascalCase file basename
-//     (`M1002ReconcileStub`), no directory prefix.
+//   - Module name is the PascalCase file basename with the numeric
+//     milestone-index component stripped per the paideia-as
+//     strip-numeric-prefix rule (`M1ReconcileStub`), no directory
+//     prefix.
 //   - No `test` mnemonic; the only zero-check is `cmp rax, 0` and it
 //     is not needed here (every stage compares against a wide
 //     immediate).
@@ -107,7 +109,7 @@
 //   - Labels prefixed `_m1r_`; no reserved word (`loop`, `if`, ...)
 //     appears as a label.
 
-module M1002ReconcileStub = structure {
+module M1ReconcileStub = structure {
 
   // ============================================================================
   // Fixture: a minimal well-formed caps.decl.
