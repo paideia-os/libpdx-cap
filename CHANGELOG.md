@@ -6,12 +6,89 @@ each entry maps 1:1 to a GitHub milestone in this repo (see
 `design/tooling/r49-r50-plan.md` §5.10 in the
 [paideia-os](https://github.com/paideia-os/paideia-os) repo).
 
-## Unreleased
+## 1.1.0 — 2026-09-13
 
-**Milestone:** Enhancement v1.x — libpdx-cap. Follow-up to 1.0.1;
-no version tag cut yet (see "Release-manifest note" below).
+**Milestone:** Enhancement v1.x — libpdx-cap. Additive minor over
+1.0.1: two new modules, no breaking change, no change to the
+return-code vocabulary, and no behavioural change to any 1.0.1 entry
+point.
+
+**Version-number note.** This tag is `v1.1.0`, not the `v0.5.0` named
+in the landing instruction for #20. `v1.0.0` and `v1.0.1` are already
+pushed to this repo's origin, and this tree is strictly newer than
+`v1.0.1` — tagging it `v0.5.0` would sort it *below* the release it
+supersedes and would silently defeat any consumer constraint of the
+`libpdx-cap >= 1.x` shape that `deps.list` files in this org use. The
+additive-minor bump is the semantically correct move for "two new
+modules, nothing removed, nothing redefined."
 
 ### Added
+
+- **R90-XREPO.013.M1-002 (#20):** `CapReconcile`
+  (`src/cap_reconcile.pdx`) — exec-time reconciliation client helper.
+  One entry point,
+  `cap_reconcile_at_exec(child_pid, caps_decl_ptr, caps_decl_len)`,
+  a client trampoline over SC+ syscall **118**
+  (`sys_exec_reconcile_caps`): ask the kernel to intersect a
+  freshly-forked child's inherited cap set against the `caps.decl` it
+  declares, dropping every cap the decl does not name and refusing the
+  exec if a decl-mandatory cap is missing.
+
+  **Placeholder body — returns `CAP_RECONCILE_ENOSYS` (-38)
+  unconditionally.** The kernel *body* exists (paideia-os
+  `src/kernel/core/cap/reconcile.pdx`, R90-XREPO.013.M0-001 /
+  paideia-os#2129) and the SC+ ID is allocated
+  (`src/user/syscall_shim.pdx` = 118), but the *dispatch arm* does
+  not: `core/syscall/dispatch.pdx` bounds its chain at `cmp rdi, 115;
+  ja dispatch_enosys`, routing 118 unconditionally to
+  `dispatch_enosys` (`mov rax, 0xFFFFFFFFFFFFFFDA; ret`). The
+  placeholder returns that exact value, so it is **bit-identical to a
+  fully wired trampoline at this kernel HEAD** — callers can write and
+  exercise their degrade branch for real, and the wire-in is a
+  two-line body swap with no caller change. paideia-as exposes no
+  `STB_WEAK` binding, so this is what "weak stub" means in this
+  toolchain (precedent: paideia-os `tools/user/cat/src/schema_wire.pdx`).
+
+  Constants: `SC_EXEC_RECONCILE_CAPS = 118`, `CAP_RECONCILE_OK = 0`,
+  `CAP_RECONCILE_ENOSYS = 0xFFFFFFFFFFFFFFDA`,
+  `CAP_RECONCILE_EACCES = 0xFFFFFFFFFFFFFFF3`. The last two are
+  *mirrors of kernel values*, not new libpdx-cap sentinels — the
+  return value is propagated verbatim and **nothing is allocated in
+  the `0xFFFFFFxx` band**. The families stay distinguishable by their
+  upper 32 bits (libpdx-cap codes are 32-bit sentinels, kernel errnos
+  are 64-bit sign-extended negatives).
+
+  This is the library's **first module that is not pure**. It is
+  annotated `!{mem, sysreg} @{cap}`; every other module stays
+  `!{mem} @{}`, and `caps.decl` still reads `requires: (none)` —
+  correctly, since `@{cap}` is an effect class describing what the
+  body touches while a `requires:` item names a KIND the library must
+  itself hold, and this helper holds none. Full blast radius of the
+  impurity: one new file, plus `tests/harness.pdx`'s `_start` widening
+  from `@{fs, sched}` to `@{fs, sched, cap}`. Rationale, kernel-state
+  evidence table, and the wire-in checklist are in
+  `design/architecture.md` §13.
+
+  New witness `tests/m1_002_reconcile_stub.pdx` (3 stages) asserts the
+  unwired-substrate contract across three argument shapes and is wired
+  into `tests/harness.pdx` as exit status **3**. Issue #20's
+  narrowed-set and missing-cap fingerprint halves are **not** claimed:
+  both require the kernel to actually reconcile, which it cannot until
+  the dispatch arm lands. See §13.5.
+
+- **Hosted-link hazard documented (#20).** `tools/run-tests.sh` links
+  this library into a hosted Linux ELF and runs it natively — which is
+  why libpdx-cap's SC+ IDs deliberately coincide with Linux's. Benign
+  for `sys_write` = 1 and `sys_exit` = 60; **not** benign for 118,
+  which on Linux x86-64 is `getresgid(gid_t *rgid, gid_t *egid, gid_t
+  *sgid)` — three OUT pointers, against our `(child_pid,
+  caps_decl_ptr, caps_decl_len)`. The placeholder emits no `syscall`
+  instruction, so the hazard is dormant and the "no entry point issues
+  a syscall" property is still literally true of the shipped object
+  code. The new witness is the tripwire that forces the question at
+  the body swap; `run-tests.sh`'s exit-3 arm prints the hazard rather
+  than a bare failure. **The correct response to that red is not to
+  update the expected value.**
 
 - **ENH-008 (#18):** additive caller-owned (re-entrant) context
   variants for fan-out consumers. New sixth module `CapCtx`
@@ -57,12 +134,18 @@ no version tag cut yet (see "Release-manifest note" below).
 
 ### Release-manifest note
 
-The 1.0.1 `manifest.pdxsig` hash tree does not yet cover
-`src/cap_ctx.pdx` or the new `_m4mx_*_e8` fixture and S31..S40
-stages in `tests/m4_002_caps_decl_matrix.pdx`. A follow-up issue
-should cut 1.0.2 after `shell` (the natural design partner for
-ENH-008 per its issue body) validates the context layout against
-its real fan-out path and confirms no further shape adjustments.
+`manifest.pdxsig` is **stale as of 1.1.0** and is not regenerated by
+this release. Its hash tree still describes the 1.0.1 file set: it
+does not cover `src/cap_ctx.pdx`, `src/cap_reconcile.pdx`,
+`tests/m1_002_reconcile_stub.pdx`, the `_m4mx_*_e8` fixture, or the
+S31..S40 stages in `tests/m4_002_caps_decl_matrix.pdx`. Regenerating
+it requires running the assembler over the tree, which the landing
+pass for #20 was explicitly scoped not to do, so it is recorded as a
+known gap rather than quietly left unmentioned. It should be
+regenerated — together with the two ML-DSA-65 signature slots, still
+reserved placeholders pending signing-bot infrastructure — in the
+first release cut after a full `bash tools/build.sh` +
+`bash tools/run-tests.sh` pass on this tree.
 
 ## 1.0.1 — 2026-08-25
 

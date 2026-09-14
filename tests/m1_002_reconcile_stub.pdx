@@ -1,0 +1,232 @@
+// tests/m1_002_reconcile_stub.pdx — libpdx-cap.R90-XREPO.013.M1-002
+// (libpdx-cap#20)
+//
+// Witness for `CapReconcile::cap_reconcile_at_exec`: asserts the
+// unwired-kernel contract across three argument shapes.
+//
+// -----------------------------------------------------------------------------
+// What "drives the helper against a mock kernel" means here, honestly
+// -----------------------------------------------------------------------------
+//
+// Issue #20's fingerprint asks for a "repo-side test [that] drives the
+// helper against a mock kernel, asserts a narrowed set is reported and
+// a missing expected cap raises."
+//
+// The narrowed-set and missing-cap halves of that fingerprint are NOT
+// assertable at this landing, and this file does not pretend otherwise.
+// Both require the kernel to actually reconcile, and at paideia-os HEAD
+// it cannot: `core/syscall/dispatch.pdx` bounds its cmp-chain at
+// `cmp rdi, 115; ja dispatch_enosys`, so sysno 118 never reaches the
+// already-landed `Reconcile::cap_reconcile_at_exec` body. There is no
+// narrowed set to report and no EACCES to raise — there is only
+// -ENOSYS. Faking a narrowed set by stubbing a fake kernel inside this
+// witness would assert nothing about the system: it would assert that
+// a fake returns what the fake was written to return.
+//
+// What IS assertable, and what this witness asserts, is the exact
+// contract `src/cap_reconcile.pdx` publishes for the unwired substrate
+// — that the helper reports -ENOSYS faithfully, for every argument
+// shape, so a caller's degrade branch is exercised against the real
+// current behaviour of the system rather than against a hope.
+//
+// In that sense the "mock kernel" is the unwired kernel itself: the
+// stub is an exact local model of it (bit-identical return value), and
+// these three stages pin that model in place.
+//
+// -----------------------------------------------------------------------------
+// This witness is a TRIPWIRE — that is its main job
+// -----------------------------------------------------------------------------
+//
+// It is designed to FAIL the moment someone wires the kernel dispatch
+// arm and swaps the stub body. That failure is not a defect in this
+// file; it is the alarm this file exists to ring, because the body
+// swap has a consequence that is easy to miss:
+//
+//   `tools/run-tests.sh` links every `src/*.pdx` and `tests/*.pdx`
+//   object into a HOSTED LINUX ELF64 and runs it natively. On Linux
+//   x86-64, syscall 118 is `getresgid(gid_t *rgid, gid_t *egid,
+//   gid_t *sgid)` — three OUT pointers. A real `syscall` in
+//   `cap_reconcile_at_exec`, executed under this harness, hands Linux
+//   a PID and a decl LENGTH where it expects writable pointers, and
+//   Linux stores four bytes through each.
+//
+// So whoever makes this witness go red must, in the same change,
+// either gate this file out of the hosted link or move the harness to
+// QEMU — and then rewrite these stages against the wired contract
+// (narrowed-set reported, EACCES raised), finally closing the half of
+// #20's fingerprint that is unreachable today. See
+// `src/cap_reconcile.pdx` header §4.
+//
+// -----------------------------------------------------------------------------
+// Stages
+// -----------------------------------------------------------------------------
+//   S1  no decl supplied         — (0, 0, 0): the kernel's
+//                                  permissive-default argument shape.
+//                                  Still -ENOSYS while unwired, since
+//                                  the bounds check fires before any
+//                                  body sees an argument.
+//   S2  well-formed decl         — (4242, fixture, 21): the shape a
+//                                  real shell exec path passes.
+//   S3  non-null ptr, zero len   — (4242, fixture, 0): the kernel's
+//                                  OTHER "no decl supplied" arm.
+//                                  Included because it is the shape
+//                                  most likely to diverge first once
+//                                  a real body starts inspecting
+//                                  arguments.
+//
+// Return: 0 on all-pass; else the 1-based index of the first failing
+// stage — same contract as `m4_001_roundtrip_fuzz` and
+// `m4_002_caps_decl_matrix`, so `tests/harness.pdx` prints it the same
+// way.
+//
+// -----------------------------------------------------------------------------
+// paideia-as compliance
+// -----------------------------------------------------------------------------
+//   - Module name is the PascalCase file basename
+//     (`M1002ReconcileStub`), no directory prefix.
+//   - No `test` mnemonic; the only zero-check is `cmp rax, 0` and it
+//     is not needed here (every stage compares against a wide
+//     immediate).
+//   - No `cmp reg, imm64`. Every comparison against
+//     `CAP_RECONCILE_ENOSYS` stages the constant through r11 first
+//     (`mov r11, imm64; cmp rax, r11`) — the idiom
+//     `m4_002_caps_decl_matrix.pdx` uses for all of its wide-immediate
+//     compares.
+//   - `r11` is scratch and is re-`lea`'d after every call; never
+//     assumed live across one.
+//   - Non-leaf: one callee-save push (rbx, unused — pure alignment
+//     pad) so `rsp % 16 == 0` at every nested call site (entry 8; one
+//     push flips to 0). Exactly the prologue
+//     `m4_002_caps_decl_matrix` uses.
+//   - Effects/capabilities are a superset of the callee's:
+//     `cap_reconcile_at_exec` is `!{mem, sysreg} @{cap}`, so this
+//     witness declares the same. This is the authority-widening
+//     ripple `src/cap_reconcile.pdx` header §1 describes, visible in
+//     practice — it is why that module keeps its syscall surface to
+//     one function.
+//   - Labels prefixed `_m1r_`; no reserved word (`loop`, `if`, ...)
+//     appears as a label.
+
+module M1002ReconcileStub = structure {
+
+  // ============================================================================
+  // Fixture: a minimal well-formed caps.decl.
+  //
+  // 21 bytes exactly, no NUL — "requires:" (9) + LF + "- KIND_TTY"
+  // (10) + LF. Byte-for-byte the same shape as
+  // `m4_002_caps_decl_matrix.pdx`'s `_m4mx_decl_ok2`, which is also
+  // declared `[u8; 21]` and parsed with `mov rsi, 21`.
+  //
+  // Declared `mut` (so it lands in .data, not .rodata) purely for
+  // uniformity with every other fixture in `tests/`. Nothing writes
+  // it: unlike the CapsDecl fixtures, this one is never handed to
+  // `caps_decl_parse`, so it is not NUL-terminated in place — the
+  // helper under test does not parse its buffer at all.
+  // ============================================================================
+  pub let mut _m1r_decl_fixture : [u8; 21] =
+    "requires:\n- KIND_TTY\n"
+
+  // Current stage number — mirror of the return value, written at the
+  // top of every stage. On failure a caller can read this .bss slot to
+  // confirm which stage exited. Same discipline as `_m4mx_stage`.
+  pub let mut _m1r_stage : u64 = uninit @align(8)
+
+  // ============================================================================
+  // m1_002_reconcile_stub() -> u64
+  //
+  // Signature: () -> u64 !{mem, sysreg} @{cap}
+  // RAX (output): 0 on all-pass; else the 1-based index of the first
+  //               failing stage.
+  //
+  // Non-leaf: calls `cap_reconcile_at_exec` three times. One
+  // callee-save push (rbx, unused) preserves `rsp % 16 == 0` at every
+  // nested call site.
+  // ============================================================================
+  pub let m1_002_reconcile_stub : () -> u64 !{mem, sysreg} @{cap} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "libpdx-cap R90-XREPO.013.M1-002 (libpdx-cap#20) witness for CapReconcile::cap_reconcile_at_exec. Three stages assert the published unwired-substrate contract -- CAP_RECONCILE_ENOSYS (0xFFFFFFFFFFFFFFDA, -38) -- across the three argument shapes a caller can present: S1 no decl supplied (0,0,0), S2 a well-formed 21-byte decl with a non-zero child pid (the shape a real shell exec path passes), S3 a non-null decl pointer with a zero length (the kernel's other no-decl-supplied arm, and the shape most likely to diverge first once a real body begins inspecting arguments). The narrowed-set and missing-cap halves of issue #20's fingerprint are deliberately NOT asserted: both require the kernel to actually reconcile, and at paideia-os HEAD core/syscall/dispatch.pdx bounds its cmp-chain at 'cmp rdi, 115; ja dispatch_enosys' so sysno 118 never reaches the already-landed Reconcile body -- there is no narrowed set to report and no EACCES to raise. Asserting them against a hand-rolled fake kernel inside this witness would assert only that the fake returns what the fake was written to return, which is why this file states the gap plainly instead. The witness's primary value is as a TRIPWIRE: it is built to go red the instant someone wires the dispatch arm and swaps the stub body, because that swap has a consequence that is easy to miss -- tools/run-tests.sh links every src and tests object into a hosted Linux ELF64 and runs it natively, and Linux x86-64 syscall 118 is getresgid(rgid*, egid*, sgid*), three OUT pointers, so a real syscall under that harness would hand Linux a PID and a decl length where it expects writable pointers and let it store four bytes through each. Going red forces whoever makes the swap to gate this file out of the hosted link or move the harness to QEMU before rewriting these stages against the wired contract. paideia-as conformance: no test mnemonic; every comparison against the wide ENOSYS immediate stages it through r11 first (mov r11, imm64; cmp rax, r11), the idiom m4_002_caps_decl_matrix.pdx uses for all of its wide-immediate compares, because cmp reg,imm64 is not an encodable form; r11 is scratch and is re-lea'd after every call rather than assumed live across one; each stage writes its 1-based index to the _m1r_stage .bss slot before asserting, so the fail tail can return it; non-leaf with one callee-save push (rbx, unused, pure alignment pad) so rsp modulo 16 is 0 at every nested call site (entry 8, one push flips it to 0), exactly the prologue m4_002_caps_decl_matrix uses; effects and capabilities are a superset of the callee's (cap_reconcile_at_exec is mem/sysreg and cap), which is the authority-widening ripple src/cap_reconcile.pdx header section 1 describes, made visible in practice; labels are prefixed _m1r_ so no reserved word such as loop or if is ever used as a label. The fixture is 21 bytes with no NUL, the same shape and declared size as _m4mx_decl_ok2, and is never parsed -- the helper under test does not inspect its buffer.",
+      block: {
+        // ---- prologue (alignment pad) --------------------------------------
+        push rbx;
+
+        // ====================================================================
+        // Stage 1 — no decl supplied: (child_pid=0, ptr=0, len=0).
+        //
+        // The kernel's permissive-default argument shape. While the
+        // dispatch arm is absent this is still -ENOSYS, because the
+        // bounds check fires before any body inspects an argument.
+        // ====================================================================
+        mov rax, 1;
+        lea r11, [rip + _m1r_stage];
+        mov [r11], rax;
+
+        xor rdi, rdi;                     // child_pid = 0
+        xor rsi, rsi;                     // caps_decl_ptr = 0
+        xor rdx, rdx;                     // caps_decl_len = 0
+        call cap_reconcile_at_exec;
+        mov r11, 0xFFFFFFFFFFFFFFDA;      // CAP_RECONCILE_ENOSYS
+        cmp rax, r11;
+        jne _m1r_fail;
+
+        // ====================================================================
+        // Stage 2 — well-formed decl: (4242, fixture, 21).
+        //
+        // The shape a real shell exec path passes. 4242 is an
+        // arbitrary non-zero child pid; nothing in the current path
+        // interprets it.
+        // ====================================================================
+        mov rax, 2;
+        lea r11, [rip + _m1r_stage];
+        mov [r11], rax;
+
+        mov rdi, 4242;                    // child_pid
+        lea rsi, [rip + _m1r_decl_fixture];
+        mov rdx, 21;                      // fixture length, exact
+        call cap_reconcile_at_exec;
+        mov r11, 0xFFFFFFFFFFFFFFDA;      // CAP_RECONCILE_ENOSYS
+        cmp rax, r11;
+        jne _m1r_fail;
+
+        // ====================================================================
+        // Stage 3 — non-null pointer, zero length: (4242, fixture, 0).
+        //
+        // The kernel's OTHER "no decl supplied" arm (len == 0 wins
+        // even when ptr != 0). Included because it is the shape most
+        // likely to diverge first once a real body starts inspecting
+        // arguments — a wired kernel would take the permissive arm
+        // here and return 0, not ENOSYS.
+        // ====================================================================
+        mov rax, 3;
+        lea r11, [rip + _m1r_stage];
+        mov [r11], rax;
+
+        mov rdi, 4242;                    // child_pid
+        lea rsi, [rip + _m1r_decl_fixture];
+        xor rdx, rdx;                     // caps_decl_len = 0
+        call cap_reconcile_at_exec;
+        mov r11, 0xFFFFFFFFFFFFFFDA;      // CAP_RECONCILE_ENOSYS
+        cmp rax, r11;
+        jne _m1r_fail;
+
+        // ====================================================================
+        // All stages passed.
+        // ====================================================================
+        xor rax, rax;
+        lea r11, [rip + _m1r_stage];
+        mov [r11], rax;
+        pop rbx;
+        ret;
+
+      _m1r_fail:
+        // Load the current stage index (last-written by the failing
+        // stage's prologue) and return it in rax. _m1r_stage remains
+        // at that value for a caller inspecting the .bss slot
+        // post-return.
+        lea r11, [rip + _m1r_stage];
+        mov rax, [r11];
+        pop rbx;
+        ret
+      }
+    }
+}

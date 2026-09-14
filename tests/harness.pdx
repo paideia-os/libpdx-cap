@@ -12,8 +12,9 @@
 // CHANGELOG's "10^6 LCG-driven iterations" claim had, until this file,
 // executed zero iterations.
 //
-// `_start` below calls `m4_001_roundtrip_fuzz` then (only if it passed)
-// `m4_002_caps_decl_matrix`, matching the two SC+ syscall IDs libpdx-cap's
+// `_start` below calls `m4_001_roundtrip_fuzz`, then (only if it
+// passed) `m4_002_caps_decl_matrix`, then (only if that passed)
+// `m1_002_reconcile_stub`, matching the two SC+ syscall IDs libpdx-cap's
 // consumers already rely on being stable (`sys_write` = 1, `sys_exit` =
 // 60 — the same IDs paideia-os's own userland uses, e.g.
 // `src/user/true.pdx`). Those IDs are also the native Linux x86-64
@@ -25,13 +26,30 @@
 //
 // Exit code contract
 // -------------------
-//   0 — both witnesses returned 0 (all-pass). "PASS: ..." on stdout.
+//   0 — all three witnesses returned 0 (all-pass). "PASS: ..." on
+//       stdout.
 //   1 — m4_001_roundtrip_fuzz diverged. Prints
 //       "M4-001 FAIL iter=<N>\n" (N = the 1-based iteration index,
 //       decimal) to stdout before exiting.
 //   2 — m4_002_caps_decl_matrix failed. Prints
 //       "M4-002 FAIL stage=<N>\n" (N = the 1-based stage index,
 //       decimal) to stdout before exiting.
+//   3 — m1_002_reconcile_stub failed. Prints
+//       "M1-002 FAIL stage=<N>\n" the same way. Added at
+//       R90-XREPO.013.M1-002 (#20).
+//
+// Hosted-link hazard (R90-XREPO.013.M1-002, #20)
+// -----------------------------------------------
+// The third witness exercises `CapReconcile::cap_reconcile_at_exec`,
+// whose eventual body issues SC+ syscall 118. That entry point is a
+// placeholder today and contains no `syscall` instruction, so this
+// harness is safe to run hosted. It stops being safe at the body
+// swap: **Linux x86-64 syscall 118 is `getresgid(gid_t *rgid, gid_t
+// *egid, gid_t *sgid)`** — three OUT pointers — and this harness
+// links as a hosted Linux ELF precisely because libpdx-cap's SC+ IDs
+// coincide with Linux's. Whoever wires the kernel dispatch arm must
+// gate `tests/m1_002_reconcile_stub.pdx` out of the hosted link or
+// move this harness to QEMU. See `src/cap_reconcile.pdx` header §4.
 //
 // Printing the diagnostic index (not just a nonzero exit status) is
 // deliberate: ENH-006's fingerprint requires the script to "name the
@@ -70,9 +88,18 @@ module Harness = structure {
   pub let mut _harness_msg_m4002 : [u8; 18] =
     "M4-002 FAIL stage="
 
-  // "PASS: m4_001_roundtrip_fuzz + m4_002_caps_decl_matrix both returned 0\n" = 70 bytes.
-  pub let mut _harness_msg_pass : [u8; 70] =
-    "PASS: m4_001_roundtrip_fuzz + m4_002_caps_decl_matrix both returned 0\n"
+  // "M1-002 FAIL stage=" = 18 bytes. (R90-XREPO.013.M1-002, #20.)
+  pub let mut _harness_msg_m1002 : [u8; 18] =
+    "M1-002 FAIL stage="
+
+  // "PASS: m4_001 + m4_002 + m1_002 witnesses all returned 0\n" = 56 bytes.
+  //
+  // Shortened from the 70-byte two-witness form at #20 so the line
+  // names all three witnesses without growing unboundedly as the
+  // suite does. The `mov rdx, 56` at the _h_pass call site below is
+  // the only consumer of this length and must move with it.
+  pub let mut _harness_msg_pass : [u8; 56] =
+    "PASS: m4_001 + m4_002 + m1_002 witnesses all returned 0\n"
 
   pub let mut _harness_nl : [u8; 1] = "\n"
 
@@ -163,10 +190,10 @@ module Harness = structure {
   // site (entry 8; one push flips to 0). No matching pop before either
   // exit path: sys_exit never returns.
   // ============================================================================
-  pub let _start : () -> () !{mem, sysreg} @{fs, sched} =
+  pub let _start : () -> () !{mem, sysreg} @{fs, sched, cap} =
     fn () -> unsafe {
-      effects: {mem, sysreg}, capabilities: {fs, sched},
-      justification: "libpdx-cap.ENH-006 tests/harness.pdx _start. Calls m4_001_roundtrip_fuzz; on nonzero rax, prints 'M4-001 FAIL iter=<N>\\n' (label sys_write, _harness_print_u64, newline sys_write) and exits 1 via sys_exit (SC+ ID 60). Otherwise calls m4_002_caps_decl_matrix; on nonzero rax, prints 'M4-002 FAIL stage=<N>\\n' the same way and exits 2. If both return 0, prints the PASS line and exits 0. rbx holds the witness's return value across the three-call print sequence on a failure path; it is callee-save and none of sys_write / _harness_print_u64 / the witnesses touch it. Non-leaf: one callee-save push (rbx) -> rsp % 16 == 0 at every nested-call site (entry 8; one push flips to 0). No pop before either sys_exit call since it never returns.",
+      effects: {mem, sysreg}, capabilities: {fs, sched, cap},
+      justification: "libpdx-cap.ENH-006 tests/harness.pdx _start, extended at R90-XREPO.013.M1-002 (#20) to a third witness. Calls m4_001_roundtrip_fuzz; on nonzero rax, prints 'M4-001 FAIL iter=<N>' plus newline (label sys_write, _harness_print_u64, newline sys_write) and exits 1 via sys_exit (SC+ ID 60). Otherwise calls m4_002_caps_decl_matrix; on nonzero rax, prints 'M4-002 FAIL stage=<N>' the same way and exits 2. Otherwise calls m1_002_reconcile_stub; on nonzero rax, prints 'M1-002 FAIL stage=<N>' the same way and exits 3. If all three return 0, prints the 56-byte PASS line and exits 0. The capability set gains `cap` because m1_002_reconcile_stub is annotated @{cap} -- it calls CapReconcile::cap_reconcile_at_exec, the library's one syscall-shaped entry point -- and a caller's capability set must be a superset of its callees'. That widening is the authority ripple src/cap_reconcile.pdx header section 1 documents and is confined to this harness; no src/ module outside CapReconcile is affected. rbx holds the witness's return value across the three-call print sequence on a failure path; it is callee-save and none of sys_write / _harness_print_u64 / the three witnesses touch it. Non-leaf: one callee-save push (rbx) -> rsp modulo 16 is 0 at every nested-call site (entry 8; one push flips to 0). No pop before any sys_exit call since it never returns.",
       block: {
         push rbx;
 
@@ -199,7 +226,7 @@ module Harness = structure {
       _h_check_m4002:
         call m4_002_caps_decl_matrix;
         cmp rax, 0;
-        je _h_pass;
+        je _h_check_m1002;
 
         mov rbx, rax;                   // save failing stage index
 
@@ -223,10 +250,37 @@ module Harness = structure {
         syscall;
         hlt;
 
+      _h_check_m1002:
+        call m1_002_reconcile_stub;
+        cmp rax, 0;
+        je _h_pass;
+
+        mov rbx, rax;                   // save failing stage index
+
+        mov rdi, 1;
+        lea rsi, [rip + _harness_msg_m1002];
+        mov rdx, 18;
+        mov rax, 1;
+        syscall;
+
+        mov rdi, rbx;
+        call _harness_print_u64;
+
+        mov rdi, 1;
+        lea rsi, [rip + _harness_nl];
+        mov rdx, 1;
+        mov rax, 1;
+        syscall;
+
+        mov rdi, 3;                     // exit status 3 (M1-002 failed)
+        mov rax, 60;
+        syscall;
+        hlt;
+
       _h_pass:
         mov rdi, 1;
         lea rsi, [rip + _harness_msg_pass];
-        mov rdx, 70;
+        mov rdx, 56;
         mov rax, 1;
         syscall;
 

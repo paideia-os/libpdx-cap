@@ -25,6 +25,20 @@
 #
 # Requires paideia-as >= 0.21.0, resolved the same way tools/build.sh
 # does, plus a working `ld` (binutils) on PATH.
+#
+# HOSTED-LINK HAZARD (R90-XREPO.013.M1-002, #20)
+# ----------------------------------------------
+# The SC+/Linux syscall-number coincidence described above is benign
+# for 1 and 60. It is NOT benign for every ID libpdx-cap may come to
+# use. `src/cap_reconcile.pdx` is a client helper for SC+ 118
+# (sys_exec_reconcile_caps), and **Linux x86-64 syscall 118 is
+# getresgid(gid_t *rgid, gid_t *egid, gid_t *sgid)** — three OUT
+# pointers. That helper's body is a placeholder containing no
+# `syscall` instruction, so this script is safe as written; the third
+# witness (tests/m1_002_reconcile_stub.pdx) asserts exactly that and
+# will go red the moment the body is swapped for a real syscall.
+# When it does: gate that witness out of the link below, or move this
+# harness to QEMU. Do not simply update the expected value.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -92,7 +106,7 @@ set -e
 
 case "$RC" in
     0)
-        echo "[run-tests] OK: both M4 witnesses returned 0"
+        echo "[run-tests] OK: all three witnesses returned 0"
         ;;
     1)
         echo "[run-tests] FAIL: m4_001_roundtrip_fuzz diverged (see iteration index printed above)" >&2
@@ -100,8 +114,17 @@ case "$RC" in
     2)
         echo "[run-tests] FAIL: m4_002_caps_decl_matrix failed (see stage index printed above)" >&2
         ;;
+    3)
+        echo "[run-tests] FAIL: m1_002_reconcile_stub failed (see stage index printed above)" >&2
+        echo "[run-tests] NOTE: this witness asserts CapReconcile::cap_reconcile_at_exec returns" >&2
+        echo "[run-tests]       -ENOSYS. If it went red because the kernel dispatch arm for SC+ 118" >&2
+        echo "[run-tests]       was wired and the stub body swapped, STOP: Linux x86-64 syscall 118" >&2
+        echo "[run-tests]       is getresgid(rgid*, egid*, sgid*) and this harness links hosted." >&2
+        echo "[run-tests]       Gate tests/m1_002_reconcile_stub.pdx out of the hosted link, or move" >&2
+        echo "[run-tests]       the harness to QEMU, before re-running. See src/cap_reconcile.pdx §4." >&2
+        ;;
     *)
-        echo "[run-tests] FAIL: harness exited $RC (unexpected — expected 0, 1, or 2)" >&2
+        echo "[run-tests] FAIL: harness exited $RC (unexpected — expected 0, 1, 2, or 3)" >&2
         ;;
 esac
 

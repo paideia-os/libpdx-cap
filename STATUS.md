@@ -2,9 +2,31 @@
 
 **Wave:** R49 shared library
 **Current milestone:** Enhancement v1.x — libpdx-cap (ENH-001..009) —
-CLOSED except ENH-008 (#18, deferred pending a confirmed `shell`
-fan-out need).
-**Released:** 1.0.1 (2026-08-25). **1.0.0 is WITHDRAWN** — that tag's
+CLOSED. ENH-008 (#18) landed after all. Cross-wave:
+**R90-XREPO.013.M1-002 (#20) LANDED** — `CapReconcile`, the exec-time
+reconciliation client, shipped as a frozen-shape placeholder because
+the kernel dispatch arm for SC+ 118 does not exist yet.
+**Released:** 1.1.0 (2026-09-13) — additive minor over 1.0.1, adding
+`CapCtx` (#18) and `CapReconcile` (#20); no breaking change, no
+return-code vocabulary change.
+
+**Open blocker carried forward (#20).** `cap_reconcile_at_exec` cannot
+do anything real until someone adds the sysno-118 dispatch arm in
+paideia-os `src/kernel/core/syscall/dispatch.pdx` (its cmp-chain is
+bounded at `cmp rdi, 115; ja dispatch_enosys`) wiring it to the
+already-landed `Reconcile::cap_reconcile_at_exec` body. **Before doing
+that, read `design/architecture.md` §13.4:** `tools/run-tests.sh`
+links this library into a hosted Linux ELF, and Linux x86-64 syscall
+118 is `getresgid(gid_t *, gid_t *, gid_t *)` — three OUT pointers
+against our `(child_pid, caps_decl_ptr, caps_decl_len)`. The witness
+`tests/m1_002_reconcile_stub.pdx` is the tripwire; making it green
+again by editing its expected value is the wrong fix.
+
+**Known gap:** `manifest.pdxsig` is stale as of 1.1.0 — its hash tree
+still describes the 1.0.1 file set. See the CHANGELOG's 1.1.0
+release-manifest note.
+
+**1.0.0 is WITHDRAWN** — that tag's
 tree does not assemble (missing `;` at `src/cap.pdx:214`, fixed three
 commits later). See `CHANGELOG.md`'s 1.0.1 entry for the full fix list:
 signed-jge slot-bound fail-open (#13), unwired CAP_BAD_KIND (#17),
@@ -30,6 +52,8 @@ unchanged from 1.0 — 1.0.1 is fixes + release hygiene, not a new API.
 | M4-001 (#8)     | round-trip fuzz (10^6 random cap shapes)                                       | LANDED |
 | M4-002 (#9)     | caps.decl parse-error corpus + narrowing/extra-cap invariant matrix            | LANDED |
 | M5-001 (#10)    | dual-signed release + .pdxdoc + mirror push                                    | LANDED |
+| ENH-008 (#18)   | caller-owned (re-entrant) context variants — module `CapCtx`                    | LANDED |
+| R90-XREPO.013.M1-002 (#20) | exec-time reconciliation client helper — module `CapReconcile`      | LANDED (placeholder body; kernel dispatch arm absent) |
 
 See `design/tooling/r49-r50-plan.md` §5.10 in paideia-os for the full
 milestone breakdown (M1–M5) and cross-repo dependencies.

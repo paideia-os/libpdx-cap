@@ -23,9 +23,7 @@ three concrete jobs, all pure userspace:
    on the send side, refuse to hand a child more rights than the sender
    holds (`cap_pack_narrowed`).
 
-It does **not** transport capabilities. No entry point issues a syscall
-or invokes a cap; every function is annotated `!{mem} @{}` and the
-repo's own `caps.decl` reads `requires: (none)`. It reads and writes
+It does **not** transport capabilities. It reads and writes
 caller-owned buffers backed by caps the *caller* holds, which is what
 keeps it linkable into every tool without widening any tool's
 authority. Two further modules extend the same record: `KindUserRef`
@@ -33,6 +31,22 @@ authority. Two further modules extend the same record: `KindUserRef`
 `SignedInode` (PdxFS v1 signed-inode layout plus the key-state gate
 `cp`/`mv`/`rm` use to choose between re-signing a destination and
 degrading to unsigned).
+
+Six of the seven modules are pure — every function annotated
+`!{mem} @{}`, no syscall, no cap invoked — and the repo's own
+`caps.decl` reads `requires: (none)`. The seventh, `CapReconcile`
+(v1.1.0, [#20](https://github.com/paideia-os/libpdx-cap/issues/20)), is
+the deliberate exception: exec-time reconciliation is a kernel
+operation, so a *client helper* for it can only be a trampoline. The
+exception is contained rather than avoided — one function, one file,
+annotated `!{mem, sysreg} @{cap}`; nothing else in the library moves,
+and a tool that never calls it links libpdx-cap with exactly the
+authority it had at 1.0.1. `caps.decl` still reads `requires: (none)`
+and that is correct, not stale: `@{cap}` is a paideia-as effect class
+describing what the eventual body touches, while a `requires:` item
+names a KIND the library must itself hold — and this helper holds no
+cap, it asks the kernel to act on the caller's authority over a child
+the caller forked.
 
 ## Wire format and return codes
 
@@ -81,10 +95,12 @@ a defensive pre-clear.
 
 ## API surface
 
-Twenty public entry points across five modules, every one `!{mem} @{}`
-— memory effect only, zero capabilities. Receive-side results land in
+Public entry points across seven modules. All but one are `!{mem} @{}`
+— memory effect only, zero capabilities; the exception is
+`CapReconcile::cap_reconcile_at_exec` (`!{mem, sysreg} @{cap}`), for
+the reason given under *Purpose*. Receive-side results land in
 module-owned `.bss` singletons (the `libpdx-argv` `ParsedArgs`
-pattern); a caller-owned variant is deferred past 1.0.
+pattern); `CapCtx` ships caller-owned re-entrant variants alongside.
 
 **`src/cap.pdx` — module `Cap`** (wire record + manifest reconciliation)
 
@@ -194,6 +210,55 @@ contract is the literal u64 boolean `1` (present) / `0` (absent) /
 numeric slot stays reserved in the SignedInode band rather than being
 repurposed.
 
+**`src/cap_reconcile.pdx` — module `CapReconcile`** (exec-time
+reconciliation client)
+
+```
+cap_reconcile_at_exec(child_pid, caps_decl_ptr, caps_decl_len) -> u64
+    !{mem, sysreg} @{cap}
+    Ask the kernel (SC+ 118, sys_exec_reconcile_caps) to intersect a
+    freshly-forked child's inherited cap set against the caps.decl it
+    declares, dropping every cap the decl does not name and refusing
+    the exec if a decl-mandatory cap is missing.
+    CAP_RECONCILE_OK (0) | a negative errno, propagated VERBATIM.
+```
+
+**Status: placeholder body — returns `CAP_RECONCILE_ENOSYS`
+unconditionally.** The kernel *body* exists (paideia-os
+`src/kernel/core/cap/reconcile.pdx`, landed by R90-XREPO.013.M0-001 /
+paideia-os#2129) and the SC+ ID is allocated (`src/user/syscall_shim.pdx`
+= 118), but the *dispatch arm* does not: `core/syscall/dispatch.pdx`
+bounds its chain at `cmp rdi, 115; ja dispatch_enosys`, so sysno 118 is
+routed unconditionally to `dispatch_enosys`, whose whole body is
+`mov rax, 0xFFFFFFFFFFFFFFDA; ret`. The placeholder returns that exact
+value, making it **bit-identical to a fully wired trampoline at this
+kernel HEAD** — callers can write and exercise their degrade branch for
+real today, and wiring the kernel later is a two-line body swap with no
+caller change. paideia-as exposes no `STB_WEAK` binding, so this is
+what a "weak stub" means in this toolchain; the precedent is
+paideia-os `tools/user/cat/src/schema_wire.pdx`.
+
+Constants `SC_EXEC_RECONCILE_CAPS = 118`, `CAP_RECONCILE_OK = 0`,
+`CAP_RECONCILE_ENOSYS = 0xFFFFFFFFFFFFFFDA` (-38),
+`CAP_RECONCILE_EACCES = 0xFFFFFFFFFFFFFFF3` (-13). The latter two are
+*mirrors of kernel values*, not new libpdx-cap sentinels: this module
+allocates nothing in the `0xFFFFFFxx` band above, because the issue's
+contract is to propagate the kernel's errno untouched. The families
+stay legible side by side — libpdx-cap codes are 32-bit sentinels,
+kernel errnos are 64-bit sign-extended negatives, so the upper 32 bits
+tell them apart.
+
+> **Before wiring the dispatch arm, read `src/cap_reconcile.pdx` §4.**
+> `tools/run-tests.sh` links this library into a *hosted Linux ELF* and
+> runs it natively — that is why the SC+ IDs for write/exit coincide
+> with Linux's. **Linux x86-64 syscall 118 is `getresgid(gid_t *rgid,
+> gid_t *egid, gid_t *sgid)`**: three OUT pointers. A real `syscall`
+> here under that harness would hand Linux a PID and a decl length
+> where it expects writable pointers. The placeholder emits no
+> `syscall` instruction, so the hazard is dormant;
+> `tests/m1_002_reconcile_stub.pdx` is the tripwire that forces the
+> question when someone swaps the body.
+
 ## Schemas exposed
 
 **None.** libpdx-cap declares no semantic-pipe output schemas — its own
@@ -222,7 +287,10 @@ Verified by reading source in the consuming repos at their current HEAD:
   the Cap wire format, citing `cap_pack_narrowed` and
   `cap_manifest_verify` as the authority; `tests/test_caps_narrow.pdx`
   mirrors the same record. Its planned exec path calls
-  `cap_manifest_verify` directly.
+  `cap_manifest_verify` directly, and is also the intended first caller
+  of `cap_reconcile_at_exec` — shell#39 is the issue that requested the
+  SC+ 118 allocation this module wraps, and R90-XREPO.013.M2-001 is the
+  shell wire-in that closes the loop.
 - [`cp`](https://github.com/paideia-os/cp) — **declared dependency, not
   yet linked.** `src/signed_inode.pdx` is a stub that unconditionally
   degrades to an unsigned destination, with a documented cross-repo
@@ -243,13 +311,14 @@ now that `kind_user_ref_decode` has shipped.
 
 ## Version
 
-**v1.0.1**, tagged 2026-08-25 — `v1.0.0` is WITHDRAWN (that tag's tree
-does not assemble; see `CHANGELOG.md`). `v1.0.1` is the first tag cut
-from a tree that has actually been assembled and whose M4 witnesses
-have actually run and returned `0` (`bash tools/run-tests.sh`).
-Milestones M1–M5 remain closed; public surface and return-code
-vocabulary remain frozen — 1.0.1 is fixes + release hygiene, not a
-new API. See [`CHANGELOG.md`](CHANGELOG.md) for the milestone
+**v1.1.0** — additive minor over `v1.0.1`. Two additions, no breaking
+change and no return-code vocabulary change: the caller-owned
+re-entrant `CapCtx` module (ENH-008, #18) and the `CapReconcile`
+exec-time reconciliation client (R90-XREPO.013.M1-002, #20). Every
+1.0.1 entry point keeps its behaviour and its annotation. `v1.0.1`
+(tagged 2026-08-25) remains the 1.0 line's good tag; `v1.0.0` is
+WITHDRAWN (that tag's tree does not assemble; see `CHANGELOG.md`).
+Milestones M1–M5 remain closed. See [`CHANGELOG.md`](CHANGELOG.md) for the milestone
 roll-up, the fix list, the test contract, and the dual-signature
 status (the two ML-DSA-65 slots in `manifest.pdxsig` are reserved
 placeholders pending signing-bot infrastructure).
@@ -257,15 +326,17 @@ placeholders pending signing-bot infrastructure).
 session state. Requires paideia-as ≥ v0.33 (`mov_b` narrow load,
 `@align` on `.bss` slots).
 
-`tests/` ships two self-contained witnesses linkable by any consumer:
-`m4_001_roundtrip_fuzz.pdx` (10^6-iteration pack/unpack round-trip) and
-`m4_002_caps_decl_matrix.pdx` (30-stage parser, narrowing, extra-cap,
-signed-inode, and slot-bound matrix). Both return 0 on pass, else the
-1-based index of the first failure. `bash tools/run-tests.sh` links
-both witnesses (plus every `src/*.pdx` module and `tests/harness.pdx`)
-into one hosted ELF64 executable and actually runs it — exit `0` means
-both witnesses returned 0; `1` or `2` print the diverging M4-001
-iteration or M4-002 stage index before exiting nonzero.
+`tests/` ships three self-contained witnesses linkable by any consumer:
+`m4_001_roundtrip_fuzz.pdx` (10^6-iteration pack/unpack round-trip),
+`m4_002_caps_decl_matrix.pdx` (40-stage parser, narrowing, extra-cap,
+signed-inode, slot-bound and re-entrancy matrix), and
+`m1_002_reconcile_stub.pdx` (3-stage `CapReconcile` unwired-substrate
+contract). All three return 0 on pass, else the 1-based index of the
+first failure. `bash tools/run-tests.sh` links them (plus every
+`src/*.pdx` module and `tests/harness.pdx`) into one hosted ELF64
+executable and actually runs it — exit `0` means all three returned 0;
+`1`, `2` or `3` print the diverging M4-001 iteration, M4-002 stage or
+M1-002 stage index before exiting nonzero.
 
 ## Examples
 

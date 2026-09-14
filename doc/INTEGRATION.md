@@ -119,8 +119,57 @@ documented limitation, not a bug): every step above reads and writes
 module-owned `.bss` singletons. Interleaving two live `cap_unpack`s,
 or parsing two `caps.decl`s, in the same process requires call-ordering
 discipline the API does not (yet) give you a way to express — see
-ENH-008 (libpdx-cap#18) if that is your situation (e.g. a fan-out
-supervisor holding several caps live at once).
+`CapCtx` (ENH-008, libpdx-cap#18) if that is your situation (e.g. a
+fan-out supervisor holding several caps live at once).
+
+### 2.5 Ask the kernel to reconcile the child at exec (v1.1.0, #20)
+
+Steps 2.1–2.4 are all *userspace* checks: the parent narrows what it
+sends, and the child verifies what it received. Neither can drop a cap
+the child inherited but never declared — only the kernel can walk and
+narrow a task's cap table. `cap_reconcile_at_exec` is the client side
+of that operation, called by the parent between forking the child and
+transferring control into its image:
+
+```
+mov rdi, r12;                    // child_pid from fork
+lea rsi, [rip + child_decl];     // the child's caps.decl bytes
+mov rdx, r13;                    // decl_len (0 = "no decl supplied")
+call cap_reconcile_at_exec;
+cmp rax, 0;
+je  reconciled;                  // narrowed — proceed to exec
+
+mov r11, 0xFFFFFFFFFFFFFFDA;     // CAP_RECONCILE_ENOSYS
+cmp rax, r11;
+je  substrate_absent;            // degrade: exec unnarrowed (see below)
+jmp refuse_exec;                 // EACCES or another errno
+```
+
+Note the `mov r11, imm64; cmp rax, r11` staging — `cmp reg, imm64` is
+not an encodable form, and this is the idiom used throughout this
+repo's own witnesses.
+
+**The `substrate_absent` branch is not optional today — it is the only
+branch you will reach.** The helper currently returns
+`CAP_RECONCILE_ENOSYS` unconditionally, because the kernel dispatch
+arm for SC+ 118 does not exist yet (the body and the syscall ID both
+do; see `design/architecture.md` §13.2). The placeholder returns the
+byte-exact value a fully wired trampoline returns at this kernel HEAD,
+so you can write *and exercise* this branch for real now, and nothing
+in your code changes when the kernel is wired.
+
+Two consequences worth planning for:
+
+- Decide deliberately whether `substrate_absent` degrades (exec the
+  child with its inherited, unnarrowed set) or refuses. Degrading is
+  what the substrate's own permissive-default posture implies today;
+  refusing is what a fail-closed deployment will eventually want. The
+  kernel M0 body notes the same flip is coming on its side.
+- Calling this helper puts `@{cap}` in your effect set, since a
+  caller's capability set must be a superset of its callees'. This is
+  the **only** entry point in libpdx-cap with that property — see the
+  README's *Purpose* section and `design/architecture.md` §13.1. If
+  you do not call it, linking v1.1.0 costs you exactly what 1.0.1 did.
 
 ---
 

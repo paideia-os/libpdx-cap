@@ -1,0 +1,363 @@
+// src/cap_reconcile.pdx — libpdx-cap.R90-XREPO.013.M1-002 (libpdx-cap#20)
+// CapReconcile: exec-time capability-reconciliation CLIENT helper.
+//
+// One entry point: `cap_reconcile_at_exec(child_pid, caps_decl_ptr,
+// caps_decl_len)`. A parent (today: the shell's exec path) calls it
+// between forking a child and transferring control into the child's
+// freshly-loaded image, to ask the kernel to intersect the child's
+// parent-inherited cap set against the caps.decl the child declares —
+// dropping every cap the decl does not enumerate, and refusing the
+// exec outright if a decl-marked-mandatory cap is missing.
+//
+// -----------------------------------------------------------------------------
+// 1. Why this module exists at all, and what it costs
+// -----------------------------------------------------------------------------
+//
+// Every other module in this library is pure: `README.md` states the
+// invariant outright — "It does not transport capabilities. No entry
+// point issues a syscall or invokes a cap; every function is annotated
+// !{mem} @{} and the repo's own caps.decl reads requires: (none)" —
+// and `design/enhancement-plan.md` §1 names it "the load-bearing one:
+// it is what lets every tool link libpdx-cap without widening its own
+// authority."
+//
+// This module is the FIRST in the library whose eventual body issues a
+// syscall. That is not an accident of implementation; it is what the
+// issue asks for. Reconciliation is a kernel operation — only the
+// kernel can walk and narrow a task's cap table — so a CLIENT helper
+// for it is necessarily a trampoline, not a pure function. The
+// architectural mitigation is containment, not avoidance:
+//
+//   - The syscall-issuing surface is exactly ONE function in exactly
+//     ONE file. `Cap`, `CapCtx`, `CapsDecl`, `KindNames`,
+//     `KindUserRef` and `SignedInode` remain `!{mem} @{}` throughout;
+//     a tool that does not call `cap_reconcile_at_exec` links this
+//     library with exactly the authority it had before.
+//   - The library's own `caps.decl` still reads `requires: (none)`.
+//     That remains CORRECT, not a stale oversight: `@{cap}` below is
+//     a paideia-as effect-system capability CLASS, describing what the
+//     eventual body touches, whereas a caps.decl `requires:` item
+//     names a KIND the library itself must HOLD. This helper holds no
+//     cap handle of its own — it asks the kernel to act on the
+//     CALLER's authority over a child the CALLER forked. See
+//     `caps.decl`'s header comment, updated at this landing.
+//
+// -----------------------------------------------------------------------------
+// 2. Kernel-side state at this landing: body LANDED, dispatch NOT WIRED
+// -----------------------------------------------------------------------------
+//
+// Verified against paideia-os HEAD, not assumed:
+//
+//   (a) The kernel BODY exists. `src/kernel/core/cap/reconcile.pdx`
+//       (module `Reconcile`) ships `cap_reconcile_at_exec(task_ptr,
+//       caps_decl_pa, caps_decl_len) -> u64`, landed by
+//       R90-XREPO.013.M0-001 (paideia-os#2129) — this issue's stated
+//       dependency. Its contract is `0` (OK) or a negative errno; it
+//       reserves `CAP_RECONCILE_EACCES = 0xFFFFFFFFFFFFFFF3` (-13) as
+//       the mandatory-cap-missing sentinel, currently unreachable
+//       because the M0 body is itself a permissive MVP stub that
+//       accepts any input.
+//
+//   (b) The SC+ syscall ID is allocated. paideia-os
+//       `src/user/syscall_shim.pdx` declares
+//       `sys_exec_reconcile_caps` at SC+ ID **118**, shifted off the
+//       issue-requested 96 (already `sys_sendto`). 118 sits in that
+//       file's contiguous "Wave U" block (116 fstat, 117 sigaction,
+//       118 this, 119 clock_ticks).
+//
+//   (c) The kernel DISPATCH ARM DOES NOT EXIST.
+//       `src/kernel/core/syscall/dispatch.pdx` bounds its cmp-chain
+//       with `cmp rdi, 115; ja dispatch_enosys`, and the chain's last
+//       arm is `cmp rdi, 115; ... jmp dispatch_enosys`. Sysno 118 is
+//       therefore unconditionally routed to `dispatch_enosys`, whose
+//       whole body is `mov rax, 0xFFFFFFFFFFFFFFDA; ret`.
+//
+// So the kernel today answers sysno 118 with -ENOSYS for every
+// argument shape, and will keep doing so until someone adds the
+// dispatch arm that calls the already-landed `Reconcile::
+// cap_reconcile_at_exec`. This module is written to that fact.
+//
+// -----------------------------------------------------------------------------
+// 3. What "WEAK stub" means in this toolchain
+// -----------------------------------------------------------------------------
+//
+// The issue asks for a WEAK stub. A true STB_WEAK binding — a fallback
+// body the linker discards when a stronger definition is present — is
+// NOT available here. paideia-os `tools/user/libpdx-argv/src/
+// version_backend.pdx` records why: "the paideia-as 0.36 encoder does
+// not currently expose the STB_WEAK binding", and `tools/user/cat/src/
+// schema_wire.pdx` spells out the consequence — an `extern`/UND
+// reference to a symbol no object in the build provides fails
+// `ld -nostdlib --fatal-warnings` outright.
+//
+// The established in-ecosystem expression of "WEAK stub" is therefore
+// the one `schema_wire.pdx` and the two `pipe_wire.pdx` siblings use,
+// and the one taken here: **a real symbol with real linkage, carrying
+// the eventual real contract's exact argument shape and effect
+// annotation, whose BODY is a placeholder.** The signature is frozen
+// now so that wiring the kernel later is a body swap and nothing else
+// — no caller re-annotates, no caller re-shuffles registers, no
+// caller's `deps.list` moves.
+//
+// The placeholder chosen here is unusually strong: it returns
+// `CAP_RECONCILE_ENOSYS`, which is **bit-identical to what the real
+// trampoline returns today** (see §2(c)). A caller cannot distinguish
+// this stub from a fully-wired `mov rax, 118; syscall; ret` at this
+// kernel HEAD. That is the point — the stub is not a lie about the
+// system's behaviour, it is an exact local model of it, so callers can
+// land and exercise their -ENOSYS-degrade branch for real.
+//
+// -----------------------------------------------------------------------------
+// 4. Why the stub does NOT execute `syscall` — a live hazard, not caution
+// -----------------------------------------------------------------------------
+//
+// This is the finding most worth carrying forward to whoever swaps the
+// body in. `tools/run-tests.sh` links every `src/*.pdx` and
+// `tests/*.pdx` object into a **hosted Linux ELF64** and runs it on
+// the developer's machine. That works precisely because libpdx-cap's
+// SC+ IDs coincide with native Linux x86-64 syscall numbers — the
+// script's own header says so ("sys_write = 1, sys_exit = 60 ... which
+// are ALSO the native Linux x86-64 syscall numbers").
+//
+// That coincidence is benign for 1 and 60. It is NOT benign for 118.
+// On Linux x86-64, **syscall 118 is `getresgid(gid_t *rgid, gid_t
+// *egid, gid_t *sgid)`** — three OUT pointers. Our argument shape is
+// `(child_pid, caps_decl_ptr, caps_decl_len)`. A real `syscall` here,
+// executed under the hosted harness, would hand Linux a PID where it
+// expects a writable pointer and a LENGTH where it expects a writable
+// pointer, and Linux would write four bytes through each. Best case
+// EFAULT; worst case a silent four-byte corruption of whatever the
+// decl length happens to alias.
+//
+// Because this landing's body contains no `syscall` instruction at
+// all, that hazard is dormant and the repo's "no entry point issues a
+// syscall" property survives §1's landing intact — it becomes false
+// only at the body swap. Whoever performs that swap MUST at the same
+// time either gate `tests/m1_002_reconcile_stub.pdx` out of the hosted
+// link, or move the harness to QEMU. The witness that accompanies this
+// module exists as the tripwire that forces the question: it asserts
+// -ENOSYS, so it fails loudly the moment the body changes.
+//
+// -----------------------------------------------------------------------------
+// 5. Return-code vocabulary: propagated, NOT translated
+// -----------------------------------------------------------------------------
+//
+// `design/architecture.md` §5 reserves the 32-bit `0xFFFFFFxx` band
+// for this library's own failures. This module deliberately allocates
+// NOTHING in that band. Per the issue, the syscall's errno is
+// "propagated directly": `rax` comes back from the kernel and is
+// returned untouched.
+//
+// The two vocabularies stay legible side by side because they occupy
+// disjoint value space as this library emits them: libpdx-cap's codes
+// are 32-bit sentinels (`0xFFFFFFEF`..`0xFFFFFFFE`), kernel errnos are
+// 64-bit sign-extended negatives (`0xFFFFFFFFFFFFFF..`). A caller that
+// stashes both without tagging tells them apart by the upper 32 bits.
+//
+// The three constants below are therefore MIRRORS of kernel values,
+// published so a caller can compile its branches against stable names
+// rather than open-coded magic — the same reason the kernel's own
+// `Reconcile` module publishes `CAP_RECONCILE_EACCES` while its M0
+// body can never return it. They are not new libpdx-cap sentinels and
+// they are not listed in the §5 band table.
+//
+// -----------------------------------------------------------------------------
+// 6. Symbol-name overlap with the kernel is intentional and harmless
+// -----------------------------------------------------------------------------
+//
+// This module exports `cap_reconcile_at_exec`, the same name the
+// kernel's `Reconcile` module uses for the body that eventually
+// services it. The two never meet in one link unit — libpdx-cap is a
+// userspace library and is never linked into the kernel image — and
+// the shared name is the useful documentation: the userspace entry and
+// the kernel entry are the two ends of one operation, with matching
+// arity and matching `(context, decl_ptr, decl_len)` argument order.
+//
+// -----------------------------------------------------------------------------
+// paideia-as compliance
+// -----------------------------------------------------------------------------
+//   - Module name is the PascalCase file basename (`CapReconcile`),
+//     no directory prefix — matches every sibling in `src/`.
+//   - Function name is prefixed with the module's snake basename
+//     (`cap_reconcile_*`), matching `caps_decl_*`, `kind_user_ref_*`,
+//     `signed_inode_*`.
+//   - No `test` mnemonic anywhere.
+//   - No `cmp reg, imm64` anywhere. The body performs no compare at
+//     all; the sole 64-bit immediate is a `mov rax, imm64`, the exact
+//     form `dispatch_enosys` already proves at paideia-os HEAD.
+//   - `r11` is untouched, so its scratch reservation is trivially
+//     respected.
+//   - Leaf function: no push, no pop, no callee-save register
+//     touched. SysV `rsp % 16` parity is therefore preserved by
+//     construction — the body cannot perturb it, and it issues no
+//     nested call. (This matters at the body swap too: a `syscall`
+//     instruction needs no stack alignment, so the swap stays a
+//     two-line edit with no prologue to add.)
+//   - Declaring effects/capabilities the placeholder body does not
+//     exercise is accepted by this toolchain: the kernel's own
+//     `Reconcile::cap_reconcile_at_exec` declares `!{mem} @{cap}`
+//     over a body of `cmp/je/xor/ret` that touches neither memory nor
+//     a cap, and assembles at paideia-os HEAD. The annotation here
+//     describes the FROZEN contract, not the placeholder.
+//   - Labels are prefixed `caprec_` (none are needed at this landing;
+//     the prefix is reserved so the body swap cannot reach for a
+//     reserved word like `loop` or `if`).
+
+module CapReconcile = structure {
+
+  // ============================================================================
+  // SC+ syscall ID
+  //
+  // 118 = sys_exec_reconcile_caps.
+  //
+  // This repo has no syscall-number header and no vendored kernel ABI
+  // file — libpdx-cap has never needed one, because until this module
+  // it issued no syscalls. (`tests/harness.pdx` open-codes `mov rax,
+  // 1` / `mov rax, 60` with an inline comment rather than naming
+  // constants, which is the whole precedent available here.) The
+  // number is therefore defined LOCALLY, and this comment is the
+  // provenance record:
+  //
+  //   paideia-os `src/user/syscall_shim.pdx`:
+  //     "sys_exec_reconcile_caps(child_pid, child_caps_decl_ptr,
+  //      child_caps_decl_len) -> reconciled cap count or negative
+  //      errno ... SC+ ID 118 -- shifted off the issue-requested 96,
+  //      which is SC+ ID for sys_sendto."
+  //
+  // Note that the shim's own summary line says "reconciled cap count
+  // or negative errno" while the kernel BODY it names
+  // (`core/cap/reconcile.pdx`) documents and returns `0` (OK) or a
+  // negative errno — no count. The body is authoritative; this module
+  // documents `0 = success` accordingly. Flagged rather than silently
+  // reconciled, because a future wire-in that really does return a
+  // count would change this helper's success contract from "== 0" to
+  // ">= 0" and every caller's branch with it.
+  //
+  // If a shared syscall-number header ever lands in this org, this
+  // constant should be deleted in favour of it rather than kept in
+  // sync by hand.
+  // ============================================================================
+  pub let SC_EXEC_RECONCILE_CAPS : u64 = 118
+
+  // ============================================================================
+  // Return-value mirrors (kernel vocabulary — see header §5)
+  // ============================================================================
+
+  // Reconciliation permitted. Mirrors `Reconcile::CAP_RECONCILE_OK`.
+  pub let CAP_RECONCILE_OK : u64 = 0
+
+  // -ENOSYS (38). The value `dispatch_enosys` returns for any sysno
+  // the kernel's cmp-chain does not claim, and therefore the value
+  // sysno 118 yields at paideia-os HEAD. Byte-identical to the
+  // in-tree precedents `NIC_ENOSYS` (core/net/nic_dispatch.pdx) and
+  // `UO_ENOSYS` (tools/user/umount.pdxfs/src/unmount_op.pdx).
+  //
+  // Deliberately the 64-bit negative form rather than a bare `38`:
+  // this helper propagates the kernel's return verbatim, so the
+  // constant a caller compares against must be what the kernel
+  // actually puts in rax.
+  pub let CAP_RECONCILE_ENOSYS : u64 = 0xFFFFFFFFFFFFFFDA
+
+  // -EACCES (13). Mirrors `Reconcile::CAP_RECONCILE_EACCES`: the
+  // child declared a mandatory cap its parent-inherited set does not
+  // contain, so the exec must be refused. UNREACHABLE at this
+  // landing twice over — the dispatch arm is missing, and the M0
+  // kernel body could not return it even if it were present. It is
+  // published now so a caller's refuse-the-exec branch compiles
+  // against a stable name and needs no edit when the substrate goes
+  // fail-closed.
+  pub let CAP_RECONCILE_EACCES : u64 = 0xFFFFFFFFFFFFFFF3
+
+  // ============================================================================
+  // cap_reconcile_at_exec(child_pid, caps_decl_ptr, caps_decl_len) -> u64
+  //
+  // Signature: cap_reconcile_at_exec : (u64, u64, u64) -> u64
+  //                                      !{mem, sysreg} @{cap}
+  //
+  // RDI (input): child_pid       — PID of the freshly-forked child
+  //                                whose cap set is to be narrowed.
+  // RSI (input): caps_decl_ptr   — VA of the child's caps.decl bytes.
+  //                                0 means "no decl supplied"
+  //                                (permissive-default arm, kernel
+  //                                side).
+  // RDX (input): caps_decl_len   — length of that buffer in bytes.
+  //                                0 also means "no decl supplied",
+  //                                even when caps_decl_ptr is
+  //                                non-zero.
+  //
+  // RAX (output):
+  //     CAP_RECONCILE_OK (0)      — reconciliation permitted; the
+  //                                 child's cap table has been
+  //                                 narrowed to its decl.
+  //     a negative errno          — propagated VERBATIM from the
+  //                                 kernel. Known values today:
+  //                                 CAP_RECONCILE_ENOSYS (dispatch
+  //                                 arm absent — the only outcome at
+  //                                 this HEAD) and, once wired,
+  //                                 CAP_RECONCILE_EACCES.
+  //
+  // The caller owns the decl buffer and must keep it mapped and
+  // readable across the call. This helper neither parses nor inspects
+  // it — parsing the same bytes in userspace is what `CapsDecl::
+  // caps_decl_parse` is for, and a caller that wants to validate its
+  // own decl before handing it to the kernel should call that first.
+  // Passing an unparsed buffer is legal; the kernel is the authority.
+  //
+  // Caller contract (the degrade branch is NOT optional at this HEAD):
+  //
+  //     mov rdi, r12;                   // child_pid from fork
+  //     lea rsi, [rip + child_decl];
+  //     mov rdx, r13;                   // decl_len
+  //     call cap_reconcile_at_exec;
+  //     cmp rax, 0;
+  //     je  reconciled;                 // narrowed — proceed to exec
+  //     mov r11, 0xFFFFFFFFFFFFFFDA;    // CAP_RECONCILE_ENOSYS
+  //     cmp rax, r11;
+  //     je  substrate_absent;           // degrade: exec unnarrowed
+  //     jmp refuse_exec;                // EACCES or another errno
+  //
+  // Note the `mov r11, imm64; cmp rax, r11` staging — `cmp reg,
+  // imm64` is not an encodable form, and this is the idiom
+  // `tests/m4_002_caps_decl_matrix.pdx` already uses for every
+  // wide-immediate compare in this repo.
+  //
+  // Register plan (leaf, no nested calls, no `syscall` at this
+  // landing):
+  //   rax = return value
+  //   rdi / rsi / rdx = inputs, left untouched (so the body swap can
+  //                     consume them in place with no shuffle: SysV
+  //                     arg registers 1-3 are already the SYSCALL arg
+  //                     registers 1-3, and arity 3 < 4 means no
+  //                     rcx -> r10 move is needed).
+  //   r11 = untouched.
+  //
+  // BODY SWAP, for whoever wires the dispatch arm. Replace the single
+  // `mov rax, imm64` below with:
+  //
+  //     mov rax, 118;                   // SC_EXEC_RECONCILE_CAPS
+  //     syscall;
+  //
+  // and nothing else in this file, this library, or any caller
+  // changes. Then read header §4 before running `tools/run-tests.sh`.
+  // ============================================================================
+  pub let cap_reconcile_at_exec : (u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (child_pid: u64) (caps_decl_ptr: u64) (caps_decl_len: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "libpdx-cap R90-XREPO.013.M1-002 (libpdx-cap#20): exec-time capability-reconciliation client helper. Frozen-shape placeholder landing, expressed the only way this toolchain supports a WEAK stub -- a real, linkable symbol carrying the eventual contract's exact arity, argument order and effect annotation, with a placeholder body -- per the in-ecosystem precedent of tools/user/cat/src/schema_wire.pdx and tools/user/libpdx-argv/src/version_backend.pdx, both of which record that the paideia-as 0.36 encoder does not expose the STB_WEAK binding and that an UND reference to an unprovided symbol fails ld --fatal-warnings outright. Kernel state verified at paideia-os HEAD rather than assumed: the BODY exists (core/cap/reconcile.pdx, module Reconcile, landed by R90-XREPO.013.M0-001 / paideia-os#2129, this issue's stated dependency) and the SC+ ID is allocated (user/syscall_shim.pdx, sys_exec_reconcile_caps = 118), but the DISPATCH ARM does not -- core/syscall/dispatch.pdx bounds its cmp-chain at 'cmp rdi, 115; ja dispatch_enosys', so sysno 118 is unconditionally routed to dispatch_enosys, whose entire body is 'mov rax, 0xFFFFFFFFFFFFFFDA; ret'. The placeholder therefore returns exactly 0xFFFFFFFFFFFFFFDA (-ENOSYS, 38), which makes this stub BIT-IDENTICAL to a fully wired 'mov rax, 118; syscall; ret' at this kernel HEAD: a caller cannot distinguish them, so the -ENOSYS degrade branch every caller must carry can be written and exercised for real today. The body issues NO syscall instruction, which is a correctness requirement and not conservatism: tools/run-tests.sh links every src and tests object into a HOSTED LINUX ELF64 and runs it natively (that is exactly why libpdx-cap's SC+ IDs for write/exit coincide with Linux's), and Linux x86-64 syscall 118 is getresgid(rgid*, egid*, sgid*) -- three OUT pointers. Executing the real syscall under that harness would hand Linux a PID and a LENGTH where it expects writable pointers and let it store four bytes through each. Keeping the instruction out until the harness moves to QEMU or gates this witness keeps the hazard dormant AND keeps the library's documented 'no entry point issues a syscall' invariant (README, design/enhancement-plan.md section 1) literally true at this landing. Return value is propagated verbatim per the issue: no translation into the 0xFFFFFFxx band design/architecture.md section 5 reserves for this library, and no sentinel allocated in it -- kernel errnos are 64-bit sign-extended negatives and libpdx-cap codes are 32-bit sentinels, so the two families stay distinguishable by the upper 32 bits. The published CAP_RECONCILE_OK / ENOSYS / EACCES constants are mirrors of kernel values so callers compile branches against stable names, exactly as the kernel's own Reconcile module publishes CAP_RECONCILE_EACCES while its M0 body cannot return it. Declaring effects and capabilities the placeholder does not exercise is accepted by this toolchain and is the point of a frozen shape: the kernel's own Reconcile::cap_reconcile_at_exec declares mem and cap over a cmp/je/xor/ret body that touches neither, and assembles at paideia-os HEAD. sysreg and cap name what the eventual syscall body touches, so no caller re-annotates at the swap. paideia-as conformance: no test mnemonic; no cmp reg,imm64 (no compare at all -- the sole wide immediate is a mov rax,imm64, the exact form dispatch_enosys proves in-tree); r11 untouched so its scratch reservation is trivially respected; rdi/rsi/rdx left untouched so the swap consumes them in place with no shuffle (SysV args 1-3 are already SYSCALL args 1-3 and arity 3 is below the rcx-to-r10 threshold); leaf function, no push/pop, no callee-save touched, so rsp modulo 16 parity is preserved by construction and the swap needs no prologue; labels reserved under the caprec_ prefix so the swap cannot reach for a reserved word.",
+      block: {
+        // Unwired-kernel arm — the ONLY arm at this landing.
+        //
+        // Bit-identical to what `mov rax, 118; syscall; ret` returns
+        // today, because dispatch.pdx routes every sysno above 115 to
+        // `dispatch_enosys: mov rax, 0xFFFFFFFFFFFFFFDA; ret`.
+        //
+        // Arguments are intentionally not inspected: the real
+        // trampoline does not inspect them either (the kernel's
+        // bounds check fires before any argument reaches a body), so
+        // inspecting them here would make the stub LESS faithful, not
+        // more careful.
+        mov rax, 0xFFFFFFFFFFFFFFDA;    // CAP_RECONCILE_ENOSYS (-38)
+        ret
+      }
+    }
+}

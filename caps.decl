@@ -13,6 +13,33 @@
 # InitCap sidecar per src/kernel/core/loader/init_caps.pdx in
 # paideia-os).
 #
+# R90-XREPO.013.M1-002 (#20) addendum — still (none), and why.
+#
+# src/cap_reconcile.pdx adds the library's first entry point whose
+# EVENTUAL body issues a syscall: cap_reconcile_at_exec, a client
+# trampoline over SC+ 118 (sys_exec_reconcile_caps). It is annotated
+# !{mem, sysreg} @{cap}. That did NOT change this file, for two
+# independent reasons, both worth stating so a future reader does not
+# "fix" it:
+#
+#   1. @{cap} is a paideia-as effect-system capability CLASS — it
+#      describes what the eventual body touches. A `requires:` item
+#      here names a KIND the library must itself HOLD. libpdx-cap
+#      holds no cap handle of its own: cap_reconcile_at_exec asks the
+#      kernel to act on the CALLER's authority over a child the
+#      CALLER forked. A caller that needs a cap to do that declares it
+#      in its own caps.decl, exactly as the note below already says.
+#
+#   2. At this landing the entry point's body is a placeholder and
+#      contains no syscall instruction at all — the kernel dispatch
+#      arm for SC+ 118 does not exist yet, so the real trampoline
+#      would return -ENOSYS anyway. The "no syscall is issued"
+#      sentence above is therefore still literally true of the shipped
+#      object code.
+#
+# Reason 1 survives the body swap; reason 2 does not. Revisit this
+# file only if libpdx-cap ever comes to hold a cap of its own.
+#
 # Callers that use libpdx-cap must independently declare in their own
 # caps.decl any caps their tool requires. This file exists so the R49
 # caps-manifest tooling can consult a uniform declaration for every
